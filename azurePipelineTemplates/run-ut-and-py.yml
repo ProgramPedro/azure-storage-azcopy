@@ -43,9 +43,20 @@ jobs:
           - ImageOverride -equals $(imageName)
     steps:
       - task: UsePythonVersion@0
+        name: 'Set_up_Python_on_AzureLinux3'
+        inputs:
+          # Ideally, all agents would use the same version of Python in this pipeline.
+          # However, this is the only version azurelinux 3 seems to support, as judged
+          # by the messages this task logs when run in the pipeline with versionSpec
+          # set to 3.10.
+          versionSpec: '3.12.13'
+        condition: eq(variables.imageName, 'azurelinux3')
+
+      - task: UsePythonVersion@0
         name: 'Set_up_Python'
         inputs:
           versionSpec: '3.10'
+        condition: ne(variables.imageName, 'azurelinux3')
 
       - task: GoTool@0
         name: 'Set_up_Microsoft_Golang'
@@ -99,14 +110,14 @@ jobs:
           - 'common/parallel'
           - 'sddl'
           fips: $(fips)
-          job_name: $(display_name)
+          display_name: $(display_name)
 
       - template: run-ut.yml
         parameters:
           directories:
           - 'ste'
           fips: $(fips)
-          job_name: $(display_name)
+          display_name: $(display_name)
           with_federated_credential: true
 
       - script: |

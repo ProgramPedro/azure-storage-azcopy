@@ -5,7 +5,7 @@ parameters:
   - name: fips
     type: string
     default: ''
-  - name: job_name
+  - name: display_name
     type: string
   - name: with_federated_credential
     type: boolean
@@ -142,7 +142,7 @@ steps:
     inputs:
       testRunner: JUnit
       testResultsFiles: '$(System.DefaultWorkingDirectory)/**/$(junitReportName)'
-      testRunTitle: '${{ directory }} Tests - ${{ parameters.job_name }}'
+      testRunTitle: 'Unit Tests: ${{ parameters.display_name }} - ${{ directory }}'
     condition: succeededOrFailed()
 
   - task: PublishCodeCoverageResults@1
