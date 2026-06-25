@@ -83,6 +83,7 @@ extends:
                   GO111MODULE: 'on'
                 inputs:
                   version: $(AZCOPY_GOLANG_VERSION)
+                  # We use the Microsoft build of Go to produce FIPS-capable Linux builds, but that should not affect the output of azcopy --version.
 
               - script: |
                   go build -tags "netgo" -o azcopy_bin
@@ -107,6 +108,7 @@ extends:
                   fi
                 displayName: 'Verify and extract the generated build version'
                 name: SetAzCopyVersion
+        # AzCopyVersion ends here
 
       - stage: BuildArtifacts
         dependsOn: AzCopyVersion
@@ -143,6 +145,7 @@ extends:
                 parameters:
                   host_architecture: 'amd64'
                   host_suffix: 'x86_64'
+                  package_conflicts: 'azcopy-fips'
 
           - job: Linux_Arm64
             timeoutInMinutes: 120
@@ -177,6 +180,84 @@ extends:
                 parameters:
                   host_architecture: 'arm64'
                   host_suffix: 'arm64'
+                  package_conflicts: 'azcopy-fips'
+
+          - job: Linux_FIPS_Amd64
+            timeoutInMinutes: 120
+            pool:
+              name: azcopy-pool
+              image: ubuntu20-custom1espt
+              os: linux
+            templateContext:
+              outputs:
+                - output: pipelineArtifact
+                  targetPath: $(System.DefaultWorkingDirectory)/unsigned
+                  artifactName: 'azcopy-linux-fips-amd64-unsigned'
+                  displayName: 'Upload Linux FIPS Amd64 Unsigned'
+                - output: pipelineArtifact
+                  targetPath: $(System.DefaultWorkingDirectory)/binaries
+                  # We separate the FIPS builds from the other Linux builds to prevent the FIPS and non-FIPS jobs from conflicting and to easily avoid creating FIPS-capable Docker container images.
+                  artifactName: 'azcopy-binaries-linux-fips-amd64'
+                  displayName: 'Upload Linux FIPS Amd64 Binaries'
+
+            variables:
+              - name: archives
+                value: $(System.DefaultWorkingDirectory)/archives
+              - name: unsigned
+                value: $(System.DefaultWorkingDirectory)/unsigned
+              - name: binaries
+                value: $(System.DefaultWorkingDirectory)/binaries
+              - name: azcopy_version
+                value: $[ stageDependencies.AzCopyVersion.GetAzCopyVersion.outputs['SetAzCopyVersion.azcopy_version'] ]
+
+            steps:
+              - template: azurePipelineTemplates/build_linux.yml@self
+                parameters:
+                  host_architecture: 'amd64'
+                  host_suffix: 'x86_64'
+                  build_suffix: '_fips'
+                  package_suffix: '-fips'
+                  package_description_suffix: ' (with support for FIPS 140-3)'
+                  package_conflicts: 'azcopy'
+
+          - job: Linux_FIPS_Arm64
+            timeoutInMinutes: 120
+            pool:
+              name: azcopy-arm-pool
+              image: ubuntu20arm-custom1espt
+              os: linux
+              hostArchitecture: Arm64
+            templateContext:
+              outputs:
+                - output: pipelineArtifact
+                  targetPath: $(System.DefaultWorkingDirectory)/unsigned
+                  artifactName: 'azcopy-linux-fips-arm64-unsigned'
+                  displayName: 'Upload Linux FIPS Arm64 Unsigned'
+                - output: pipelineArtifact
+                  targetPath: $(System.DefaultWorkingDirectory)/binaries
+                  # We separate the FIPS builds from the other Linux builds to prevent the FIPS and non-FIPS jobs from conflicting and to easily avoid creating FIPS-capable Docker container images.
+                  artifactName: 'azcopy-binaries-linux-fips-arm64'
+                  displayName: 'Upload Linux FIPS Arm64 Binaries'
+
+            variables:
+              - name: archives
+                value: $(System.DefaultWorkingDirectory)/archives
+              - name: unsigned
+                value: $(System.DefaultWorkingDirectory)/unsigned
+              - name: binaries
+                value: $(System.DefaultWorkingDirectory)/binaries
+              - name: azcopy_version
+                value: $[ stageDependencies.AzCopyVersion.GetAzCopyVersion.outputs['SetAzCopyVersion.azcopy_version'] ]
+
+            steps:
+              - template: azurePipelineTemplates/build_linux.yml@self
+                parameters:
+                  host_architecture: 'arm64'
+                  host_suffix: 'arm64'
+                  build_suffix: '_fips'
+                  package_suffix: '-fips'
+                  package_description_suffix: ' (with support for FIPS 140-3)'
+                  package_conflicts: 'azcopy'
 
           - job: Windows
             timeoutInMinutes: 120
@@ -243,8 +324,7 @@ extends:
 
             steps:
               - template: azurePipelineTemplates/build_macos_m1.yml@self
-
-        # BuildArtifacts end here
+        # BuildArtifacts ends here
 
       - stage: SignArtifacts
         dependsOn:
@@ -268,6 +348,15 @@ extends:
                   artifactName: azcopy-linux-arm64-unsigned
                   targetPath: $(System.DefaultWorkingDirectory)/arm64
                   displayName: 'Download Linux Arm64 Unsigned'
+                # We use different target paths for the FIPS builds to easily avoid creating FIPS-capable Mariner builds
+                - input: pipelineArtifact
+                  artifactName: azcopy-linux-fips-amd64-unsigned
+                  targetPath: $(System.DefaultWorkingDirectory)/fips-amd64
+                  displayName: 'Download Linux FIPS Amd64 Unsigned'
+                - input: pipelineArtifact
+                  artifactName: azcopy-linux-fips-arm64-unsigned
+                  targetPath: $(System.DefaultWorkingDirectory)/fips-arm64
+                  displayName: 'Download Linux FIPS Arm64 Unsigned'
               outputs:
                 - output: pipelineArtifact
                   targetPath: $(System.DefaultWorkingDirectory)/signed
@@ -282,6 +371,11 @@ extends:
                 value: $(System.DefaultWorkingDirectory)/arm64
               - name: mariner
                 value: $(System.DefaultWorkingDirectory)/mariner
+              - name: fips-amd64
+                value: $(System.DefaultWorkingDirectory)/fips-amd64
+              - name: fips-arm64
+                value: $(System.DefaultWorkingDirectory)/fips-arm64
+              # We've decided not to create FIPS-compliant builds for Mariner 2.
               - name: signed
                 value: $(System.DefaultWorkingDirectory)/signed
 
@@ -321,15 +415,51 @@ extends:
                   Pattern: '*.rpm, *.deb'
                   DisplayName: 'ESRP CodeSigning azcopy mariner'
 
+              - template: setup/esrp_sign_linux.yml@self
+                parameters:
+                  FolderPath: $(fips-amd64)
+                  ESRP_AZCOPY_KEY_CODE: $(ESRP_AZCOPY_KEY_CODE)
+                  Pattern: '*.rpm, *.deb'
+                  DisplayName: 'ESRP CodeSigning azcopy linux fips amd64'
+
+              - template: setup/esrp_sign_linux.yml@self
+                parameters:
+                  FolderPath: $(fips-arm64)
+                  ESRP_AZCOPY_KEY_CODE: $(ESRP_AZCOPY_KEY_CODE)
+                  Pattern: '*.rpm, *.deb'
+                  DisplayName: 'ESRP CodeSigning azcopy linux fips arm64'
+
               - script: |
                   mkdir -p $(signed)
                   mkdir -p $(signed)/mariner
+
                   chmod 755 $(amd64)/*
                   rm -rf $(amd64)/*.md
                   mv $(amd64)/* $(signed)
+
                   chmod 755 $(arm64)/*
                   rm -rf $(arm64)/*.md
                   mv $(arm64)/* $(signed)
+                  
+                  # FIPS
+                  # To match the layout of other parts of this pipeline, this FIPS section
+                  # would be placed below the Mariner section. However, this task fails if
+                  # the last command returns a non-zero exit code, and the arm64 and FIPS
+                  # "mv" commands return 1, due to the presence of the "_manifest" folder
+                  # that was copied to the "signed" folder by the amd64 mv. Leaving
+                  # Mariner's mv at the end of this script avoids this issue, because
+                  # (like the amd64 mv), the Mariner mv targets an initially-empty folder.
+                  # For details, see the messages this task logs in the pipeline when the
+                  # Mariner mv isn't the last command in this script.
+                  chmod 755 $(fips-amd64)/*
+                  rm -rf $(fips-amd64)/*.md
+                  mv $(fips-amd64)/* $(signed)
+
+                  chmod 755 $(fips-arm64)/*
+                  rm -rf $(fips-arm64)/*.md
+                  mv $(fips-arm64)/* $(signed)
+
+                  # Mariner
                   chmod 755 $(mariner)/*
                   rm -rf $(mariner)/*.md
                   mv $(mariner)/* $(signed)/mariner
@@ -551,7 +681,7 @@ extends:
                       exit 1
                   fi
                 displayName:  'Copy signed mac binaries'
-#       SignArtifacts end here
+        # SignArtifacts ends here
 
       - stage: VerifyArtifacts
         dependsOn: SignArtifacts
@@ -562,7 +692,6 @@ extends:
               name: azcopy-pool
               image: ubuntu20-custom1espt
               os: linux
-
             templateContext:
               inputs:
                 - input: pipelineArtifact
@@ -634,12 +763,74 @@ extends:
                 value: '$(System.DefaultWorkingDirectory)/signed/mariner'
             steps:
               - checkout: none
-
               - script: |
                   sudo rpm -qip $(signed)/azcopy*x86_64.rpm
                   sudo rpm -i $(signed)/azcopy*x86_64.rpm
                   azcopy --version
                 displayName: 'Verify rpm'
+
+          - job: Ubuntu_FIPS_Amd64
+            timeoutInMinutes: 120
+            pool:
+              name: azcopy-pool
+              image: ubuntu20-custom1espt
+              os: linux
+            templateContext:
+              inputs:
+                - input: pipelineArtifact
+                  artifactName: azcopy-binaries-linux-fips-amd64
+                  targetPath: $(System.DefaultWorkingDirectory)/binaries
+                  displayName: 'Download Linux FIPS Amd64 Binaries'
+                - input: pipelineArtifact
+                  artifactName: azcopy-linux-signed
+                  targetPath: $(System.DefaultWorkingDirectory)/signed
+                  displayName: 'Download Linux Signed'
+            variables:
+              - name: signed
+                value: '$(System.DefaultWorkingDirectory)/signed'
+              - name: binaries
+                value: '$(System.DefaultWorkingDirectory)/binaries'
+              - name: extracted
+                value: '$(System.DefaultWorkingDirectory)/extracted'
+            steps:
+              - template: azurePipelineTemplates/verify_linux.yml@self
+                parameters:
+                  host_architecture: 'amd64'
+                  host_suffix: 'x86_64'
+                  build_suffix: '_fips'
+                  package_suffix: '-fips'
+
+          - job: Ubuntu_FIPS_Arm64
+            timeoutInMinutes: 120
+            pool:
+              name: azcopy-arm-pool
+              image: ubuntu20arm-custom1espt
+              os: linux
+              hostArchitecture: Arm64
+            templateContext:
+              inputs:
+                - input: pipelineArtifact
+                  artifactName: azcopy-binaries-linux-fips-arm64
+                  targetPath: $(System.DefaultWorkingDirectory)/binaries
+                  displayName: 'Download Linux FIPS Arm64 Binaries'
+                - input: pipelineArtifact
+                  artifactName: azcopy-linux-signed
+                  targetPath: $(System.DefaultWorkingDirectory)/signed
+                  displayName: 'Download Linux Signed'
+            variables:
+              - name: signed
+                value: '$(System.DefaultWorkingDirectory)/signed'
+              - name: binaries
+                value: '$(System.DefaultWorkingDirectory)/binaries'
+              - name: extracted
+                value: '$(System.DefaultWorkingDirectory)/extracted'
+            steps:
+              - template: azurePipelineTemplates/verify_linux.yml@self
+                parameters:
+                  host_architecture: 'arm64'
+                  host_suffix: 'arm64'
+                  build_suffix: '_fips'
+                  package_suffix: '-fips'
 
           - job: MacOS
             timeoutInMinutes: 120
@@ -751,8 +942,8 @@ extends:
                   cd $(extracted)\azcopy*arm64*
                   azcopy.exe --version
                 displayName: 'Verify exe in zip'
+        # VerifyArtifacts ends here
 
-      # VerifyArtifacts end here
       - stage: UploadToStorage
         dependsOn:
           - AzCopyVersion
@@ -783,11 +974,13 @@ extends:
                   sudo apt-get update --fix-missing
                   sudo apt-get install -y zip unzip
                 displayName: 'Install Dependencies'
+
               - task: GoTool@0
                 env:
                   GO111MODULE: 'on'
                 inputs:
                   version: $(AZCOPY_GOLANG_VERSION)
+                  # We use the Microsoft build of Go to produce FIPS-capable Linux builds, but that should not affect the text file this job copies.
 
               - script: |
                   go build -tags "netgo" -o azcopy_bin
@@ -833,6 +1026,18 @@ extends:
 
               - task: DownloadPipelineArtifact@2
                 inputs:
+                  artifactName: azcopy-binaries-linux-fips-amd64
+                  targetPath: $(System.DefaultWorkingDirectory)/input/azcopy-binaries-linux-fips-amd64
+                  displayName: "Download Linux FIPS AMD64 Binaries"
+
+              - task: DownloadPipelineArtifact@2
+                inputs:
+                  artifactName: azcopy-binaries-linux-fips-arm64
+                  targetPath: $(System.DefaultWorkingDirectory)/input/azcopy-binaries-linux-fips-arm64
+                  displayName: "Download Linux FIPS ARM64 Binaries"
+
+              - task: DownloadPipelineArtifact@2
+                inputs:
                   artifactName: azcopy-binaries-windows
                   targetPath: $(System.DefaultWorkingDirectory)/input/azcopy-binaries-windows
                   displayName: "Download Windows Binaries"
@@ -847,6 +1052,8 @@ extends:
                   mkdir -p $(drop)
                   cp $(input)/azcopy-binaries-linux-amd64/azcopy* $(drop)
                   cp $(input)/azcopy-binaries-linux-arm64/azcopy* $(drop)
+                  cp $(input)/azcopy-binaries-linux-fips-amd64/azcopy* $(drop)
+                  cp $(input)/azcopy-binaries-linux-fips-arm64/azcopy* $(drop)
                   cp $(input)/azcopy-binaries-windows/azcopy* $(drop)
                   cp $(input)/azcopy-binaries-mac/azcopy* $(drop)
                   cp $(System.DefaultWorkingDirectory)/NOTICE.txt $(drop)
@@ -873,8 +1080,10 @@ extends:
                       m1_container_url="https://azcopyvnextrelease.blob.core.windows.net/%24web/azcopy-m1-drops/azcopy-$(azcopy_version)-$today"
                     AZCOPY_AUTO_LOGIN_TYPE=AzCLI ./azcopy_bin cp "$(input)/azcopy-binaries-mac/azcopy_darwin_m1_arm64" "$m1_container_url" --recursive --put-md5=true
                     fi
-      # UploadToStorage end here
+        # UploadToStorage ends here
+
       - ${{ if eq(parameters.publish_docker_image, true) }}:
+          # We're not yet ready to publish FIPS-capable Docker container images.
           - stage: BuildAndPublishDockerImage
             dependsOn:
               - AzCopyVersion
@@ -984,7 +1193,7 @@ extends:
                     inputs:
                       image: azcopycontainers.azurecr.io/azure-azcopy-mariner-arm64.$(azcopy_version):latest
                       remoteImage: azcopycontainers.azurecr.io/azure-azcopy-mariner-arm64.$(azcopy_version):latest
-
+            # BuildAndPublishDockerImage ends here
 
       - ${{ if eq(parameters.post_release, true) }}:
           - stage: ReleaseToGithub
@@ -1056,6 +1265,7 @@ extends:
                         $(Build.ArtifactStagingDirectory)/azcopy-mac-signed/*.zip
                         $(Build.ArtifactStagingDirectory)/azcopy-linux-signed/mariner/*
                       assetUploadMode: replace
+            # ReleaseToGithub ends here
 
       - ${{ if eq(parameters.publish_artifacts, true) }}:
           - stage: PublishArtifacts
@@ -1239,6 +1449,7 @@ extends:
                                 pmc --auth-type wif --base-url "https://pmc-ingest.trafficmanager.net/api/v4" repo publish $repoName
                               fi
                             done < <(tail -n +3 ../packages.csv)
+            # PublishArtifacts ends here
 
       - ${{ if ne(parameters.remove_packages, '') }}:
           - stage: RemovePackagesFromLinuxRepository
@@ -1334,3 +1545,4 @@ extends:
                           done
                       done
                     displayName: 'Remove rpm packages from the repository'
+            # RemovePackagesFromLinuxRepository ends here
