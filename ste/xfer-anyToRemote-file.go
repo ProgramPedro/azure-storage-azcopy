@@ -377,6 +377,10 @@ func anyToRemote_file(jptm IJobPartTransferMgr, info *TransferInfo, pacer pacer,
 	// stop tracking pseudo id (since real chunk id's will be tracked from here on)
 	jptm.LogChunkStatus(pseudoId, common.EWaitReason.ChunkDone())
 
+	// Read-only dedupe prototype diagnostic (opt-in via AZCOPY_DEDUPE_OBSERVE). No-op when
+	// disabled; never alters the transfer.
+	observeSourceGrid(jptm)
+
 	// Step 6: Go through the file and schedule chunk messages to send each chunk
 	scheduleSendChunks(jptm, info.Source, srcFile, srcSize, s, sourceFileFactory, srcInfoProvider)
 }

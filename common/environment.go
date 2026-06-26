@@ -477,3 +477,15 @@ func (EnvironmentVariable) DisableBlobTransferResume() EnvironmentVariable {
 		Description:  "An incomplete transfer to blob endpoint will be resumed from start if set to true",
 	}
 }
+
+// DedupeObserve gates a read-only prototype diagnostic. When set to "true", block-blob to
+// block-blob S2S transfers log how the source blob's committed block boundaries line up with
+// AzCopy's uniform chunk grid. It never changes transfer behavior. Intentionally not listed in
+// VisibleEnvironmentVariables because it is an internal prototype switch, not a supported feature.
+func (EnvironmentVariable) DedupeObserve() EnvironmentVariable {
+	return EnvironmentVariable{
+		Name:         "AZCOPY_DEDUPE_OBSERVE",
+		DefaultValue: "false",
+		Description:  "Prototype diagnostic: when true, logs how source block-blob committed block boundaries align with AzCopy's uniform chunk grid (read-only, no transfer behavior change).",
+	}
+}
