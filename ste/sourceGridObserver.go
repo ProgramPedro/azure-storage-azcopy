@@ -21,6 +21,8 @@
 package ste
 
 import (
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
@@ -60,10 +62,13 @@ type SourceGridPlan struct {
 }
 
 // rawCommittedBlock is the minimal block info needed to build a plan: the committed block name
-// and its size. Offsets are derived (committed block lists are returned in order).
+// and its size, plus the optional per-block content hashes returned when the service supports the
+// include=crc64,sha256 extension. Offsets are derived (committed block lists are returned in order).
 type rawCommittedBlock struct {
-	Name string
-	Size int64
+	Name   string
+	Size   int64
+	CRC64  uint64
+	SHA256 [32]byte
 }
 
 // buildSourceGridPlan converts an ordered committed block list into a SourceGridPlan, assigning
@@ -79,6 +84,8 @@ func buildSourceGridPlan(blocks []rawCommittedBlock) (*SourceGridPlan, error) {
 			Offset:       offset,
 			Size:         b.Size,
 			SrcBlockName: b.Name,
+			CRC64:        b.CRC64,
+			SHA256:       b.SHA256,
 		})
 		offset += b.Size
 	}
@@ -182,9 +189,17 @@ func observeSourceGrid(jptm IJobPartTransferMgr) {
 	}
 	srcClient := bsc.NewContainerClient(info.SrcContainer).NewBlockBlobClient(info.SrcFilePath)
 
-	resp, err := srcClient.GetBlockList(jptm.Context(), blockblob.BlockListTypeCommitted, nil)
+	// Request the per-block content hashes (include=crc64,sha256). The service only returns them for
+	// committed block lists when the GetHash feature is enabled; otherwise the fields are nil and we
+	// simply observe zero hashes.
+	resp, err := srcClient.GetBlockList(jptm.Context(), blockblob.BlockListTypeCommitted, &blockblob.GetBlockListOptions{
+		Include: []blockblob.BlockListIncludeItem{
+			blockblob.BlockListIncludeItemCrc64,
+			blockblob.BlockListIncludeItemSha256,
+		},
+	})
 	if err != nil {
-		jptm.LogAtLevelForCurrentTransfer(common.LogDebug, "dedupe-observe: GetBlockList(committed) failed: "+err.Error())
+		jptm.LogAtLevelForCurrentTransfer(common.LogDebug, "dedupe-observe: GetBlockList(committed, include=crc64,sha256) failed: "+err.Error())
 		return
 	}
 
@@ -195,12 +210,32 @@ func observeSourceGrid(jptm IJobPartTransferMgr) {
 	}
 
 	raw := make([]rawCommittedBlock, 0, len(resp.CommittedBlocks))
-	for _, b := range resp.CommittedBlocks {
-		raw = append(raw, rawCommittedBlock{
+	hashedBlocks := 0
+	for i, b := range resp.CommittedBlocks {
+		rb := rawCommittedBlock{
 			Name: common.IffNotNil(b.Name, ""),
 			Size: common.IffNotNil(b.Size, 0),
-		})
+		}
+		// Azure Storage encodes CRC64 little-endian (matches crc64.Checksum(content, azure table)).
+		if len(b.Crc64) == 8 {
+			rb.CRC64 = binary.LittleEndian.Uint64(b.Crc64)
+		}
+		copy(rb.SHA256[:], b.Sha256)
+		if len(b.Crc64) > 0 || len(b.Sha256) > 0 {
+			hashedBlocks++
+		}
+		raw = append(raw, rb)
+
+		// Phase 0 read-only log of the extended per-block fields exactly as returned by the service.
+		jptm.LogAtLevelForCurrentTransfer(common.LogInfo, fmt.Sprintf(
+			"dedupe-observe: block[%d] name=%s offset=%d size=%d crc64=%s sha256=%s",
+			i, rb.Name, common.IffNotNil(b.Offset, -1), rb.Size,
+			hex.EncodeToString(b.Crc64), hex.EncodeToString(b.Sha256)))
 	}
+
+	jptm.LogAtLevelForCurrentTransfer(common.LogInfo, fmt.Sprintf(
+		"dedupe-observe: %d/%d committed blocks carried crc64+sha256 hashes (0 means the service GetHash feature is off or include was not honored)",
+		hashedBlocks, len(resp.CommittedBlocks)))
 
 	plan, err := buildSourceGridPlan(raw)
 	if err != nil {
