@@ -245,4 +245,8 @@ func observeSourceGrid(jptm IJobPartTransferMgr) {
 
 	stats := plan.AlignmentToUniformGrid(info.BlockSize)
 	jptm.LogAtLevelForCurrentTransfer(common.LogInfo, stats.String())
+
+	// Phase 1: record these committed blocks into the per-job dedupe table and log the running
+	// would-be-hit rate. This is still read-only with respect to the transfer (no bytes skipped).
+	recordSourceGridForDedupe(jptm, plan)
 }
