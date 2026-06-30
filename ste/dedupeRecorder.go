@@ -119,6 +119,10 @@ func measureAndRecord(table *common.DedupeHashTable, jobID common.JobID, targetU
 			CRC64:     b.CRC64,
 			SHA256:    b.SHA256,
 			TargetURI: targetURI,
+			// The destination is a byte-identical copy of the source, so the block lives
+			// at the same offset/length in the target blob as in the source.
+			TargetOffset: b.Offset,
+			TargetLength: b.Size,
 			// ETag is populated in Phase 2, where recording happens after a successful
 			// destination write; Phase 1 records pre-write, for measurement only.
 		})
@@ -169,4 +173,56 @@ func recordSourceGridForDedupe(jptm IJobPartTransferMgr, plan *SourceGridPlan) {
 		info.SrcFilePath, hits, hashed,
 		totalHits, totalHashed, dedupePercent(totalHits, totalHashed),
 		totalBytes, st.table.Len()))
+}
+
+// --- Phase 2 core: staging-time hit decision (pure; not yet wired into the transfer path) ---
+
+// srcBlockKey identifies a source committed block by its position and length. A uniform AzCopy
+// chunk can be matched to a source block (and so to its content hashes) only when the two share the
+// same offset and size — until source-grid chunking (Phase 3) makes every chunk a source block, the
+// index therefore only resolves chunks that already align with the source's committed boundaries.
+type srcBlockKey struct {
+	offset int64
+	size   int64
+}
+
+// srcBlockHashes are the content hashes of a single source committed block.
+type srcBlockHashes struct {
+	crc64  uint64
+	sha256 [32]byte
+}
+
+// buildSourceBlockHashIndex turns a source-grid plan into a lookup from a block's (offset,size) to
+// its content hashes, including only blocks that actually carry hashes. The staging path consults it
+// to discover whether the chunk it is about to send has a known hash to look up.
+func buildSourceBlockHashIndex(plan *SourceGridPlan) map[srcBlockKey]srcBlockHashes {
+	idx := make(map[srcBlockKey]srcBlockHashes, len(plan.Blocks))
+	for _, b := range plan.Blocks {
+		if !blockHasHashes(b) {
+			continue
+		}
+		idx[srcBlockKey{offset: b.Offset, size: b.Size}] = srcBlockHashes{crc64: b.CRC64, sha256: b.SHA256}
+	}
+	return idx
+}
+
+// decideStaging is the core Phase 2 "act on a hit" decision for a single block about to be staged at
+// [offset, offset+size) of the source. It returns the matching target entry with reference=true when
+// (a) the chunk exactly matches a hashed source block, and (b) that content is already recorded as
+// committed at the destination — meaning the block can be staged from the target blob (Put Block
+// From URL over the target's sub-range) instead of re-read from the source. Otherwise it returns
+// reference=false and the caller stages from the source as normal.
+//
+// It is pure (no I/O, no jptm) so the decision can be unit tested exhaustively before being wired
+// into generatePutBlockFromURL.
+func decideStaging(index map[srcBlockKey]srcBlockHashes, committed *common.DedupeHashTable, offset, size int64) (target common.BlockEntry, reference bool) {
+	h, ok := index[srcBlockKey{offset: offset, size: size}]
+	if !ok {
+		return common.BlockEntry{}, false // no known hash for this chunk (not aligned to a source block)
+	}
+	entry, hit := committed.Lookup(h.crc64, h.sha256)
+	if !hit {
+		return common.BlockEntry{}, false // identical content not yet migrated to the destination
+	}
+	return entry, true
 }

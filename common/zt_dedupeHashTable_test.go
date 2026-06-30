@@ -35,12 +35,14 @@ func sha256Of(s string) [32]byte {
 
 func newTestEntry(crc64 uint64, content string) BlockEntry {
 	return BlockEntry{
-		JobID:     NewJobID(),
-		CRC64:     crc64,
-		SHA256:    sha256Of(content),
-		TargetURI: "https://acct.blob.core.windows.net/c/" + content,
-		ETag:      azcore.ETag("etag-" + content),
-		RefCount:  1,
+		JobID:        NewJobID(),
+		CRC64:        crc64,
+		SHA256:       sha256Of(content),
+		TargetURI:    "https://acct.blob.core.windows.net/c/" + content,
+		TargetOffset: 100,
+		TargetLength: 200,
+		ETag:         azcore.ETag("etag-" + content),
+		RefCount:     1,
 	}
 }
 
@@ -59,6 +61,8 @@ func TestDedupeHashTable_InsertAndLookup(t *testing.T) {
 	got, ok := tbl.Lookup(e.CRC64, e.SHA256)
 	a.True(ok)
 	a.Equal(e.TargetURI, got.TargetURI)
+	a.Equal(e.TargetOffset, got.TargetOffset)
+	a.Equal(e.TargetLength, got.TargetLength)
 	a.Equal(e.ETag, got.ETag)
 
 	// Miss: SHA256 differs even though CRC64 matches.

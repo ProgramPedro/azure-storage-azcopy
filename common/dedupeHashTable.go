@@ -44,6 +44,14 @@ type BlockEntry struct {
 	// TargetURI is the location of the already-stored block content that a hit
 	// can be served from / referenced against.
 	TargetURI string
+	// TargetOffset and TargetLength locate the block's content within TargetURI.
+	// Because Azure block IDs are blob-scoped, a hit cannot reuse another blob's
+	// block by ID; instead it is served by staging from this sub-range of the
+	// already-migrated target blob (Put Block From URL over
+	// [TargetOffset, TargetOffset+TargetLength)). Both are therefore required to
+	// address content inside an existing blob.
+	TargetOffset int64
+	TargetLength int64
 	// ETag is the concurrency/version token of the target, used to detect whether
 	// the referenced content has changed since it was recorded.
 	ETag azcore.ETag
