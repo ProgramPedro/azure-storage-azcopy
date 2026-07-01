@@ -26,7 +26,6 @@ import (
 	"fmt"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
-	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
 
 	"github.com/Azure/azure-storage-azcopy/v10/common"
 )
@@ -182,22 +181,10 @@ func observeSourceGrid(jptm IJobPartTransferMgr) {
 		return
 	}
 
-	bsc, err := jptm.SrcServiceClient().BlobServiceClient()
-	if err != nil {
-		jptm.LogAtLevelForCurrentTransfer(common.LogDebug, "dedupe-observe: could not get source blob service client: "+err.Error())
-		return
-	}
-	srcClient := bsc.NewContainerClient(info.SrcContainer).NewBlockBlobClient(info.SrcFilePath)
-
-	// Request the per-block content hashes (include=crc64,sha256). The service only returns them for
-	// committed block lists when the GetHash feature is enabled; otherwise the fields are nil and we
-	// simply observe zero hashes.
-	resp, err := srcClient.GetBlockList(jptm.Context(), blockblob.BlockListTypeCommitted, &blockblob.GetBlockListOptions{
-		Include: []blockblob.BlockListIncludeItem{
-			blockblob.BlockListIncludeItemCrc64,
-			blockblob.BlockListIncludeItemSha256,
-		},
-	})
+	// Fetch the source committed block list, requesting the per-block content hashes
+	// (include=crc64,sha256). The service only returns them when the GetHash feature is enabled;
+	// otherwise the fields are nil and we simply observe zero hashes.
+	resp, err := getSourceBlockList(jptm)
 	if err != nil {
 		jptm.LogAtLevelForCurrentTransfer(common.LogDebug, "dedupe-observe: GetBlockList(committed, include=crc64,sha256) failed: "+err.Error())
 		return

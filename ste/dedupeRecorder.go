@@ -26,6 +26,8 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+
 	"github.com/Azure/azure-storage-azcopy/v10/common"
 )
 
@@ -40,15 +42,56 @@ import (
 // behavior. Its only job is to prove the real, end-to-end dedupe potential with hard numbers
 // before any bytes are actually skipped (Phase 2) or the chunk grid is changed (Phase 3).
 
-// dedupeJobState holds a single job's dedupe table plus cumulative would-be-hit counters.
+// dedupeJobState holds a single job's dedupe tables plus cumulative would-be-hit counters.
 type dedupeJobState struct {
+	// table is the Phase 1 measurement table: blocks are recorded pre-write purely to count the
+	// would-be-hit rate, so it must NOT be used to decide a real reference (the content may not yet
+	// exist at the destination).
 	table *common.DedupeHashTable
+
+	// committed is the Phase 2 table: it holds only blocks confirmed committed at the destination
+	// (recorded in the sender Epilogue after a successful CommitBlockList). A reference is only ever
+	// served from an entry in this table, so the target content is guaranteed to exist.
+	committed *common.DedupeHashTable
 
 	// Counters are cumulative across every blob processed for the job, and are updated
 	// atomically because transfers (and therefore observeSourceGrid calls) run concurrently.
 	hashedBlocks   int64 // blocks that carried crc64+sha256 (i.e. were eligible for dedupe)
 	wouldBeHits    int64 // eligible blocks whose content was already recorded by an earlier block
 	dedupableBytes int64 // total size of would-be-hit blocks: bytes that need not be re-transferred
+
+	// Phase 2 "act" counters (also cumulative + atomic). Together they quantify how many source
+	// reads dedupe actually avoided (enforce) or would avoid (shadow).
+	referencedBlocks     int64 // enforce: blocks staged from the destination instead of the source
+	referencedBytes      int64 // enforce: source-read bytes avoided
+	wouldReferenceBlocks int64 // shadow: blocks that would be referenced under enforce
+	wouldReferenceBytes  int64 // shadow: source-read bytes that would be avoided under enforce
+	sourceStagedBlocks   int64 // blocks staged from the source (real source reads)
+	sourceStagedBytes    int64 // bytes staged from the source
+	fallbackBlocks       int64 // enforce: hits whose target reference failed and fell back to source
+}
+
+// addReferenced records a block that enforce mode staged from the destination (a source read avoided).
+func (s *dedupeJobState) addReferenced(size int64) {
+	atomic.AddInt64(&s.referencedBlocks, 1)
+	atomic.AddInt64(&s.referencedBytes, size)
+}
+
+// addWouldReference records a block that shadow mode would have referenced under enforce.
+func (s *dedupeJobState) addWouldReference(size int64) {
+	atomic.AddInt64(&s.wouldReferenceBlocks, 1)
+	atomic.AddInt64(&s.wouldReferenceBytes, size)
+}
+
+// addSourceStaged records a block that was actually staged from the source (a real source read).
+func (s *dedupeJobState) addSourceStaged(size int64) {
+	atomic.AddInt64(&s.sourceStagedBlocks, 1)
+	atomic.AddInt64(&s.sourceStagedBytes, size)
+}
+
+// addFallback records an enforce hit whose target reference failed and fell back to the source.
+func (s *dedupeJobState) addFallback() {
+	atomic.AddInt64(&s.fallbackBlocks, 1)
 }
 
 var (
@@ -65,7 +108,10 @@ func dedupeStateForJob(jobID common.JobID) *dedupeJobState {
 
 	st, ok := dedupeJobs[jobID]
 	if !ok {
-		st = &dedupeJobState{table: common.NewDedupeHashTable()}
+		st = &dedupeJobState{
+			table:     common.NewDedupeHashTable(),
+			committed: common.NewDedupeHashTable(),
+		}
 		dedupeJobs[jobID] = st
 	}
 	return st
@@ -80,7 +126,72 @@ func clearDedupeStateForJob(jobID common.JobID) {
 
 	if st, ok := dedupeJobs[jobID]; ok {
 		st.table.Clear()
+		st.committed.Clear()
 		delete(dedupeJobs, jobID)
+	}
+}
+
+// recordCommittedBlocks records a freshly-committed destination blob's hashed blocks into the job's
+// committed table, so that later blocks with identical content can be served from this blob. It is
+// called from the sender Epilogue after CommitBlockList succeeds, with the destination's real ETag.
+// Because the destination is a byte-identical copy of the source, each block lives at the same
+// offset/length in the target blob as in the source.
+func recordCommittedBlocks(jobID common.JobID, destURI string, etag azcore.ETag, plan *SourceGridPlan) (recorded int) {
+	if plan == nil {
+		return 0
+	}
+	st := dedupeStateForJob(jobID)
+	target := sanitizedDestForDedupe(destURI)
+	for _, b := range plan.Blocks {
+		if !blockHasHashes(b) {
+			continue
+		}
+		st.committed.Insert(common.BlockEntry{
+			JobID:        jobID,
+			CRC64:        b.CRC64,
+			SHA256:       b.SHA256,
+			TargetURI:    target,
+			TargetOffset: b.Offset,
+			TargetLength: b.Size,
+			ETag:         etag,
+		})
+		recorded++
+	}
+	return recorded
+}
+
+// logDedupeActSummary logs the job's cumulative Phase 2 savings. It is emitted once per committed
+// blob (from the sender Epilogue), so the final line for a job is the job total — mirroring the
+// Phase 1 running-total pattern and avoiding the need for a job-teardown hook. It reports how many
+// source reads dedupe avoided (enforce) or would avoid (shadow).
+func logDedupeActSummary(jptm IJobPartTransferMgr, mode dedupeActMode) {
+	st := dedupeStateForJob(jptm.Info().JobID)
+
+	referencedBlocks := atomic.LoadInt64(&st.referencedBlocks)
+	referencedBytes := atomic.LoadInt64(&st.referencedBytes)
+	wouldRefBlocks := atomic.LoadInt64(&st.wouldReferenceBlocks)
+	wouldRefBytes := atomic.LoadInt64(&st.wouldReferenceBytes)
+	sourceBlocks := atomic.LoadInt64(&st.sourceStagedBlocks)
+	sourceBytes := atomic.LoadInt64(&st.sourceStagedBytes)
+	fallbacks := atomic.LoadInt64(&st.fallbackBlocks)
+
+	switch mode {
+	case dedupeActEnforce:
+		// Referenced blocks were staged from the destination; source-staged blocks were read from the
+		// source. Total = referenced + source; avoided source-read bytes = referencedBytes.
+		totalStagedBytes := referencedBytes + sourceBytes
+		jptm.LogAtLevelForCurrentTransfer(common.LogInfo, fmt.Sprintf(
+			"dedupe-summary(enforce): avoided %d source-read bytes across %d block(s) = %.1f%% of %d staged bytes; "+
+				"staged %d block(s)/%d bytes from source; %d fallback(s)",
+			referencedBytes, referencedBlocks, dedupePercent(referencedBytes, totalStagedBytes), totalStagedBytes,
+			sourceBlocks, sourceBytes, fallbacks))
+	case dedupeActShadow:
+		// Every block is staged from the source in shadow mode, so sourceBytes is the total; the
+		// would-reference blocks are the subset that enforce would have avoided.
+		jptm.LogAtLevelForCurrentTransfer(common.LogInfo, fmt.Sprintf(
+			"dedupe-summary(shadow): %d block(s)/%d bytes WOULD be avoided under enforce = %.1f%% of %d staged bytes "+
+				"(all currently staged from source)",
+			wouldRefBlocks, wouldRefBytes, dedupePercent(wouldRefBytes, sourceBytes), sourceBytes))
 	}
 }
 
