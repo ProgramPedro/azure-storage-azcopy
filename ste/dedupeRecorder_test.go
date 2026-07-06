@@ -149,6 +149,19 @@ func TestMeasureAndRecord_PopulatesTargetRange(t *testing.T) {
 	a.EqualValues(1000, got.TargetLength)
 }
 
+func TestDestinationWithSASForDedupe_AppendsDestinationSAS(t *testing.T) {
+	a := assert.New(t)
+
+	got := destinationWithSASForDedupe("https://acct.blob.core.windows.net/c/b.bin", "?sv=2021&sig=SECRET")
+	a.Equal("https://acct.blob.core.windows.net/c/b.bin?sv=2021&sig=SECRET", got)
+
+	got = destinationWithSASForDedupe("https://acct.blob.core.windows.net/c/b.bin?existing=true", "sv=2021&sig=SECRET")
+	a.Equal("https://acct.blob.core.windows.net/c/b.bin?existing=true&sv=2021&sig=SECRET", got)
+
+	plain := "https://acct.blob.core.windows.net/c/b.bin"
+	a.Equal(plain, destinationWithSASForDedupe(plain, ""))
+}
+
 func TestSanitizedDestForDedupe_StripsSAS(t *testing.T) {
 	a := assert.New(t)
 
@@ -217,7 +230,7 @@ func TestDecideStaging_NoHashForChunk(t *testing.T) {
 	committed := common.NewDedupeHashTable()
 
 	// A chunk whose (offset,size) matches no source block has no known hash -> stage from source.
-	_, reference := decideStaging(idx, committed, 0, 64)
+	_, reference := decideStaging(idx, committed, 0, 64, "https://acct.blob.core.windows.net/c/current")
 	a.False(reference)
 }
 
@@ -228,7 +241,7 @@ func TestDecideStaging_HashButNotYetCommitted(t *testing.T) {
 	idx := buildSourceBlockHashIndex(&SourceGridPlan{Blocks: []PlannedBlock{b}})
 	committed := common.NewDedupeHashTable() // nothing migrated yet
 
-	_, reference := decideStaging(idx, committed, 0, 100)
+	_, reference := decideStaging(idx, committed, 0, 100, "https://acct.blob.core.windows.net/c/current")
 	a.False(reference) // hash known, but content not present at the destination -> stage from source
 }
 
@@ -248,10 +261,30 @@ func TestDecideStaging_Hit(t *testing.T) {
 		ETag:         azcore.ETag("etag-1"),
 	})
 
-	target, reference := decideStaging(idx, committed, 0, 100)
+	target, reference := decideStaging(idx, committed, 0, 100, "https://acct.blob.core.windows.net/c/current")
 	a.True(reference)
 	a.Equal("https://acct.blob.core.windows.net/c/already-migrated", target.TargetURI)
 	a.EqualValues(0, target.TargetOffset)
 	a.EqualValues(100, target.TargetLength)
 	a.Equal(azcore.ETag("etag-1"), target.ETag)
+}
+
+func TestDecideStaging_SameTargetIsNotReusable(t *testing.T) {
+	a := assert.New(t)
+
+	b := hashedBlock("a", 0, 100)
+	idx := buildSourceBlockHashIndex(&SourceGridPlan{Blocks: []PlannedBlock{b}})
+
+	committed := common.NewDedupeHashTable()
+	committed.Insert(common.BlockEntry{
+		CRC64:        b.CRC64,
+		SHA256:       b.SHA256,
+		TargetURI:    "https://acct.blob.core.windows.net/c/current",
+		TargetOffset: 0,
+		TargetLength: 100,
+		ETag:         azcore.ETag("etag-1"),
+	})
+
+	_, reference := decideStaging(idx, committed, 0, 100, "https://acct.blob.core.windows.net/c/current?sig=secret")
+	a.False(reference)
 }

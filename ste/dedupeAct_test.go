@@ -124,18 +124,18 @@ func TestRecordCommittedBlocks_PopulatesCommittedTableForReference(t *testing.T)
 	}}
 	const dest = "https://acct.blob.core.windows.net/c/migrated?sig=secret"
 
-	recorded := recordCommittedBlocks(jobID, dest, "etag-xyz", plan)
+	recorded := recordCommittedBlocks(jobID, "https://acct.blob.core.windows.net/c/migrated", "?sig=secret", "etag-xyz", plan)
 	a.Equal(2, recorded) // only the two hashed blocks
 
 	committed := dedupeStateForJob(jobID).committed
 	a.Equal(2, committed.Len())
 
 	// A later identical block must now resolve to a reference against the recorded target, with the
-	// SAS stripped from the stored TargetURI and the destination ETag preserved.
+	// executable TargetURI (including SAS, when present) and the destination ETag preserved.
 	idx := buildSourceBlockHashIndex(plan)
-	target, reference := decideStaging(idx, committed, 0, 100)
+	target, reference := decideStaging(idx, committed, 0, 100, "https://acct.blob.core.windows.net/c/current")
 	a.True(reference)
-	a.Equal("https://acct.blob.core.windows.net/c/migrated", target.TargetURI)
+	a.Equal(dest, target.TargetURI)
 	a.EqualValues(0, target.TargetOffset)
 	a.EqualValues(100, target.TargetLength)
 	a.EqualValues("etag-xyz", target.ETag)
@@ -147,7 +147,7 @@ func TestRecordCommittedBlocks_NilPlanIsNoOp(t *testing.T) {
 	jobID := common.NewJobID()
 	defer clearDedupeStateForJob(jobID)
 
-	a.Equal(0, recordCommittedBlocks(jobID, "uri", "etag", nil))
+	a.Equal(0, recordCommittedBlocks(jobID, "uri", "", "etag", nil))
 }
 
 func TestDedupeJobStateCounters(t *testing.T) {

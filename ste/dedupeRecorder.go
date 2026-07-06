@@ -136,12 +136,12 @@ func clearDedupeStateForJob(jobID common.JobID) {
 // called from the sender Epilogue after CommitBlockList succeeds, with the destination's real ETag.
 // Because the destination is a byte-identical copy of the source, each block lives at the same
 // offset/length in the target blob as in the source.
-func recordCommittedBlocks(jobID common.JobID, destURI string, etag azcore.ETag, plan *SourceGridPlan) (recorded int) {
+func recordCommittedBlocks(jobID common.JobID, destURI, destinationSAS string, etag azcore.ETag, plan *SourceGridPlan) (recorded int) {
 	if plan == nil {
 		return 0
 	}
 	st := dedupeStateForJob(jobID)
-	target := sanitizedDestForDedupe(destURI)
+	target := destinationWithSASForDedupe(destURI, destinationSAS)
 	for _, b := range plan.Blocks {
 		if !blockHasHashes(b) {
 			continue
@@ -158,6 +158,33 @@ func recordCommittedBlocks(jobID common.JobID, destURI string, etag azcore.ETag,
 		recorded++
 	}
 	return recorded
+}
+
+// destinationWithSASForDedupe returns an executable destination URL for later use as
+// x-ms-copy-source. The destination URL in TransferInfo can be stored without SAS, so append the
+// job's destination SAS when available. The table is in-memory and logs go through AzCopy's
+// sanitizer; stripping auth here causes private DevFabric/Azure targetURI reuse to fail with 401.
+func destinationWithSASForDedupe(destURI, destinationSAS string) string {
+	if destinationSAS == "" {
+		return destURI
+	}
+	u, err := url.Parse(destURI)
+	if err != nil {
+		return destURI
+	}
+	sas := destinationSAS
+	if sas[0] == '?' {
+		sas = sas[1:]
+	}
+	if sas == "" {
+		return destURI
+	}
+	if u.RawQuery == "" {
+		u.RawQuery = sas
+	} else {
+		u.RawQuery += "&" + sas
+	}
+	return u.String()
 }
 
 // logDedupeActSummary logs the job's cumulative Phase 2 savings. It is emitted once per committed
@@ -286,7 +313,7 @@ func recordSourceGridForDedupe(jptm IJobPartTransferMgr, plan *SourceGridPlan) {
 		totalBytes, st.table.Len()))
 }
 
-// --- Phase 2 core: staging-time hit decision (pure; not yet wired into the transfer path) ---
+// --- Phase 2 core: staging-time hit decision ---
 
 // srcBlockKey identifies a source committed block by its position and length. A uniform AzCopy
 // chunk can be matched to a source block (and so to its content hashes) only when the two share the
@@ -319,14 +346,15 @@ func buildSourceBlockHashIndex(plan *SourceGridPlan) map[srcBlockKey]srcBlockHas
 
 // decideStaging is the core Phase 2 "act on a hit" decision for a single block about to be staged at
 // [offset, offset+size) of the source. It returns the matching target entry with reference=true when
-// (a) the chunk exactly matches a hashed source block, and (b) that content is already recorded as
-// committed at the destination — meaning the block can be staged from the target blob (Put Block
-// From URL over the target's sub-range) instead of re-read from the source. Otherwise it returns
-// reference=false and the caller stages from the source as normal.
+// (a) the chunk exactly matches a hashed source block, and (b) that content is already recorded in the
+// destination hash index as committed destination content — meaning the block can be staged from the
+// target blob (Put Block From URL over the target's sub-range) instead of re-read from the source.
+// Otherwise it returns reference=false and the caller stages from the source as normal.
 //
-// It is pure (no I/O, no jptm) so the decision can be unit tested exhaustively before being wired
-// into generatePutBlockFromURL.
-func decideStaging(index map[srcBlockKey]srcBlockHashes, committed *common.DedupeHashTable, offset, size int64) (target common.BlockEntry, reference bool) {
+// currentTargetURI is the blob currently being written. A matching entry for that same target is not
+// a cross-blob reuse candidate and must be ignored; same-blob hits are intentionally observe-only in
+// this targetURI design because the current blob's destination ranges are not committed/readable yet.
+func decideStaging(index map[srcBlockKey]srcBlockHashes, committed *common.DedupeHashTable, offset, size int64, currentTargetURI string) (target common.BlockEntry, reference bool) {
 	h, ok := index[srcBlockKey{offset: offset, size: size}]
 	if !ok {
 		return common.BlockEntry{}, false // no known hash for this chunk (not aligned to a source block)
@@ -335,5 +363,12 @@ func decideStaging(index map[srcBlockKey]srcBlockHashes, committed *common.Dedup
 	if !hit {
 		return common.BlockEntry{}, false // identical content not yet migrated to the destination
 	}
+	if sameDedupeTarget(entry.TargetURI, currentTargetURI) {
+		return common.BlockEntry{}, false // avoid unsafe same-blob/self reuse; wait for a committed target blob
+	}
 	return entry, true
+}
+
+func sameDedupeTarget(a, b string) bool {
+	return sanitizedDestForDedupe(a) == sanitizedDestForDedupe(b)
 }

@@ -170,16 +170,16 @@ func (c *urlToBlockBlobCopier) generatePutBlockFromURL(id common.ChunkID, blockI
 		if err := c.pacer.RequestTrafficAllocation(c.jptm.Context(), adjustedChunkSize); err != nil {
 			c.jptm.FailActiveUpload("Pacing block", err)
 		}
-		token, err := c.jptm.GetS2SSourceTokenCredential(c.jptm.Context())
-		if err != nil {
-			c.jptm.FailActiveS2SCopy("Getting source token credential", err)
+		// Block-level dedupe prototype: if this chunk's content already exists at the destination, either
+		// log it (shadow) or stage it from there instead of the source (enforce, with fallback to source).
+		if c.dedupeMode != dedupeActOff && c.tryDedupeStage(id, encodedBlockID, adjustedChunkSize) {
+			atomic.AddInt32(&c.atomicChunksWritten, 1)
 			return
 		}
 
-		// Block-level dedupe prototype: if this chunk's content already exists at the destination, either
-		// log it (shadow) or stage it from there instead of the source (enforce, with fallback to source).
-		if c.dedupeMode != dedupeActOff && c.tryDedupeStage(id, encodedBlockID, adjustedChunkSize, token) {
-			atomic.AddInt32(&c.atomicChunksWritten, 1)
+		token, err := c.jptm.GetS2SSourceTokenCredential(c.jptm.Context())
+		if err != nil {
+			c.jptm.FailActiveS2SCopy("Getting source token credential", err)
 			return
 		}
 
@@ -215,10 +215,13 @@ func (c *urlToBlockBlobCopier) generatePutBlockFromURL(id common.ChunkID, blockI
 // block was fully handled by staging it from an already-migrated destination block (enforce mode on a
 // successful reference). In shadow mode, or on any miss/failure, it returns false so the caller stages
 // the block from the source as usual.
-func (c *urlToBlockBlobCopier) tryDedupeStage(id common.ChunkID, encodedBlockID string, size int64, token *string) (handled bool) {
+func (c *urlToBlockBlobCopier) tryDedupeStage(id common.ChunkID, encodedBlockID string, size int64) (handled bool) {
 	st := dedupeStateForJob(c.jptm.Info().JobID)
-	target, reference := decideStaging(c.dedupeIndex, st.committed, id.OffsetInFile(), size)
+	target, reference := decideStaging(c.dedupeIndex, st.committed, id.OffsetInFile(), size, c.jptm.Info().Destination)
 	if !reference {
+		c.jptm.LogAtLevelForCurrentTransfer(common.LogDebug, fmt.Sprintf(
+			"dedupe-act(%s): no committed destination hash hit for offset=%d size=%d; staging from sourceURI",
+			c.dedupeMode, id.OffsetInFile(), size))
 		return false
 	}
 
@@ -231,7 +234,10 @@ func (c *urlToBlockBlobCopier) tryDedupeStage(id common.ChunkID, encodedBlockID 
 	}
 
 	// enforce: stage the block from the destination sub-range, guarded by the recorded ETag.
-	if err := c.stageBlockFromTarget(encodedBlockID, target, token); err != nil {
+	c.jptm.LogAtLevelForCurrentTransfer(common.LogDebug, fmt.Sprintf(
+		"dedupe-act(enforce): committed destination hash hit for offset=%d size=%d; staging from targetURI=%s [%d,%d)",
+		id.OffsetInFile(), size, target.TargetURI, target.TargetOffset, target.TargetOffset+target.TargetLength))
+	if err := c.stageBlockFromTarget(encodedBlockID, target); err != nil {
 		st.addFallback()
 		c.jptm.LogAtLevelForCurrentTransfer(common.LogInfo, fmt.Sprintf(
 			"dedupe-act(enforce): reference to %s failed (%v); falling back to staging from source", target.TargetURI, err))
@@ -248,12 +254,11 @@ func (c *urlToBlockBlobCopier) tryDedupeStage(id common.ChunkID, encodedBlockID 
 // (Put Block From URL) instead of re-reading the bytes from the source. The recorded ETag is sent as an
 // If-Match on the copy source so a changed/replaced target fails fast (and the caller falls back to the
 // source). The chunk has already been paced by the caller, so it is not re-paced here.
-func (c *urlToBlockBlobCopier) stageBlockFromTarget(encodedBlockID string, target common.BlockEntry, token *string) error {
+func (c *urlToBlockBlobCopier) stageBlockFromTarget(encodedBlockID string, target common.BlockEntry) error {
 	options := &blockblob.StageBlockFromURLOptions{
-		Range:                   blob.HTTPRange{Offset: target.TargetOffset, Count: target.TargetLength},
-		CPKInfo:                 c.jptm.CpkInfo(),
-		CPKScopeInfo:            c.jptm.CpkScopeInfo(),
-		CopySourceAuthorization: token,
+		Range:        blob.HTTPRange{Offset: target.TargetOffset, Count: target.TargetLength},
+		CPKInfo:      c.jptm.CpkInfo(),
+		CPKScopeInfo: c.jptm.CpkScopeInfo(),
 	}
 	if target.ETag != "" {
 		etag := target.ETag

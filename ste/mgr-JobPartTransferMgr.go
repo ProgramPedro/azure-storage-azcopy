@@ -17,13 +17,14 @@ import (
 	"net/url"
 
 	"github.com/Azure/azure-storage-azcopy/v10/common"
-	"github.com/Azure/azure-storage-azcopy/v10/common/buildmode"	
+	"github.com/Azure/azure-storage-azcopy/v10/common/buildmode"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
 type IJobPartTransferMgr interface {
 	FromTo() common.FromTo
 	Info() *TransferInfo
+	SAS() (sourceSAS, destinationSAS string)
 	ResourceDstData(dataFileToXfer []byte) (headers common.ResourceHTTPHeaders, metadata common.Metadata, blobTags common.BlobTags, cpkOptions common.CpkOptions)
 	LastModifiedTime() time.Time
 	PreserveLastModifiedTime() (time.Time, bool)
@@ -448,6 +449,10 @@ func (jptm *jobPartTransferMgr) Info() *TransferInfo {
 		VersionID:         versionID,
 		SnapshotID:        snapshotID,
 	}
+}
+
+func (jptm *jobPartTransferMgr) SAS() (sourceSAS, destinationSAS string) {
+	return jptm.jobPartMgr.SAS()
 }
 
 func (jptm *jobPartTransferMgr) Context() context.Context {
