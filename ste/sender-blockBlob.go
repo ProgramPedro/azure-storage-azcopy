@@ -359,7 +359,7 @@ func (s *blockBlobSenderBase) Epilogue() {
 				etag = *resp.ETag
 			}
 			_, destinationSAS := jptm.SAS()
-			recorded := recordCommittedBlocks(jptm.Info().JobID, jptm.Info().Destination, destinationSAS, etag, s.dedupePlan)
+			recorded := recordCommittedBlocks(jptm.Info().JobID, s.destBlockBlobClient.URL(), destinationSAS, etag, s.dedupePlan)
 			jptm.LogAtLevelForCurrentTransfer(common.LogInfo, fmt.Sprintf(
 				"dedupe-act(%s): recorded %d committed block(s) for %q into the job dedupe table",
 				s.dedupeMode, recorded, jptm.Info().DstFilePath))
