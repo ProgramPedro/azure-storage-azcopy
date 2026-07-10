@@ -22,10 +22,11 @@ package ste
 
 import (
 	"fmt"
+	"sync/atomic"
+
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/file"
-	"sync/atomic"
 
 	"github.com/Azure/azure-storage-azcopy/v10/common"
 )
@@ -81,7 +82,7 @@ func newURLToBlockBlobCopier(jptm IJobPartTransferMgr, pacer pacer, srcInfoProvi
 
 // configureBlockBlobDedupe arms source-grid chunking + the dedupe hit decision on a block-blob S2S
 // copier when AZCOPY_DEDUPE_ACT is set and the source is a block blob with a committed block list. It
-// overrides the sender's chunk count so every chunk lines up with a hashed source block. Any problem
+// overrides the sender's chunk count so every chunk lines up with a source block. Any problem
 // leaves dedupe off and the copy proceeds on the uniform grid, so it can never break a transfer.
 func configureBlockBlobDedupe(jptm IJobPartTransferMgr, c *urlToBlockBlobCopier, srcInfoProvider IRemoteSourceInfoProvider) {
 	mode := dedupeActModeFromEnv()
@@ -110,12 +111,20 @@ func configureBlockBlobDedupe(jptm IJobPartTransferMgr, c *urlToBlockBlobCopier,
 		return
 	}
 
+	dedupeIndex := buildSourceBlockHashIndex(plan)
+	if len(dedupeIndex) == 0 {
+		jptm.LogAtLevelForCurrentTransfer(common.LogDebug,
+			"dedupe-act: source block list contained no complete hashes, using uniform grid")
+		return
+	}
+
 	// One chunk per source committed block.
 	c.numChunks = uint32(len(plan.Blocks))
 	c.blockIDs = make([]string, c.numChunks)
 	c.dedupeMode = mode
 	c.dedupePlan = plan
-	c.dedupeIndex = buildSourceBlockHashIndex(plan)
+	c.dedupeIndex = dedupeIndex
+	setDedupeActModeForJob(jptm.Info().JobID, mode)
 
 	jptm.LogAtLevelForCurrentTransfer(common.LogInfo, fmt.Sprintf(
 		"dedupe-act(%s): source-grid chunking armed: %d block(s), %d with hashes, totalSize=%d",
@@ -229,24 +238,24 @@ func (c *urlToBlockBlobCopier) tryDedupeStage(id common.ChunkID, encodedBlockID 
 		st.addWouldReference(size)
 		c.jptm.LogAtLevelForCurrentTransfer(common.LogInfo, fmt.Sprintf(
 			"dedupe-act(shadow): block at offset=%d size=%d WOULD be referenced from %s [%d,%d) (staging from source instead)",
-			id.OffsetInFile(), size, target.TargetURI, target.TargetOffset, target.TargetLength))
+			id.OffsetInFile(), size, sanitizedDestForDedupe(target.TargetURI), target.TargetOffset, target.TargetLength))
 		return false
 	}
 
 	// enforce: stage the block from the destination sub-range, guarded by the recorded ETag.
 	c.jptm.LogAtLevelForCurrentTransfer(common.LogDebug, fmt.Sprintf(
 		"dedupe-act(enforce): committed destination hash hit for offset=%d size=%d; staging from targetURI=%s [%d,%d)",
-		id.OffsetInFile(), size, target.TargetURI, target.TargetOffset, target.TargetOffset+target.TargetLength))
+		id.OffsetInFile(), size, sanitizedDestForDedupe(target.TargetURI), target.TargetOffset, target.TargetOffset+target.TargetLength))
 	if err := c.stageBlockFromTarget(encodedBlockID, target); err != nil {
 		st.addFallback()
 		c.jptm.LogAtLevelForCurrentTransfer(common.LogInfo, fmt.Sprintf(
-			"dedupe-act(enforce): reference to %s failed (%v); falling back to staging from source", target.TargetURI, err))
+			"dedupe-act(enforce): reference to %s failed (%v); falling back to staging from source", sanitizedDestForDedupe(target.TargetURI), err))
 		return false
 	}
 	st.addReferenced(size)
 	c.jptm.LogAtLevelForCurrentTransfer(common.LogDebug, fmt.Sprintf(
 		"dedupe-act(enforce): block at offset=%d size=%d staged from %s [%d,%d)",
-		id.OffsetInFile(), size, target.TargetURI, target.TargetOffset, target.TargetLength))
+		id.OffsetInFile(), size, sanitizedDestForDedupe(target.TargetURI), target.TargetOffset, target.TargetLength))
 	return true
 }
 
@@ -255,14 +264,23 @@ func (c *urlToBlockBlobCopier) tryDedupeStage(id common.ChunkID, encodedBlockID 
 // If-Match on the copy source so a changed/replaced target fails fast (and the caller falls back to the
 // source). The chunk has already been paced by the caller, so it is not re-paced here.
 func (c *urlToBlockBlobCopier) stageBlockFromTarget(encodedBlockID string, target common.BlockEntry) error {
+	if target.ETag == "" {
+		return fmt.Errorf("dedupe target is missing an ETag")
+	}
+	if target.TargetLength <= 0 {
+		return fmt.Errorf("dedupe target has invalid length %d", target.TargetLength)
+	}
+	if target.TargetOffset < 0 {
+		return fmt.Errorf("dedupe target has invalid offset %d", target.TargetOffset)
+	}
+	etag := target.ETag
 	options := &blockblob.StageBlockFromURLOptions{
 		Range:        blob.HTTPRange{Offset: target.TargetOffset, Count: target.TargetLength},
 		CPKInfo:      c.jptm.CpkInfo(),
 		CPKScopeInfo: c.jptm.CpkScopeInfo(),
-	}
-	if target.ETag != "" {
-		etag := target.ETag
-		options.SourceModifiedAccessConditions = &blob.SourceModifiedAccessConditions{SourceIfMatch: &etag}
+		SourceModifiedAccessConditions: &blob.SourceModifiedAccessConditions{
+			SourceIfMatch: &etag,
+		},
 	}
 	_, err := c.destBlockBlobClient.StageBlockFromURL(c.jptm.Context(), encodedBlockID, target.TargetURI, options)
 	return err

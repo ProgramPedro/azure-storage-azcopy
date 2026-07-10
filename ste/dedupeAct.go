@@ -112,10 +112,11 @@ func rawCommittedBlocksFromResponse(resp blockblob.GetBlockListResponse) []rawCo
 			Name: common.IffNotNil(b.Name, ""),
 			Size: common.IffNotNil(b.Size, 0),
 		}
-		if len(b.Crc64) == 8 {
+		if len(b.Crc64) == 8 && len(b.Sha256) == 32 {
 			rb.CRC64 = binary.LittleEndian.Uint64(b.Crc64)
+			copy(rb.SHA256[:], b.Sha256)
+			rb.HasHashes = true
 		}
-		copy(rb.SHA256[:], b.Sha256)
 		raw = append(raw, rb)
 	}
 	return raw

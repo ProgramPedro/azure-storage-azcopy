@@ -22,6 +22,8 @@ package common
 
 import (
 	"crypto/sha256"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -113,6 +115,48 @@ func TestDedupeHashTable_CRC64Collision(t *testing.T) {
 	a.Equal(e2.TargetURI, got2.TargetURI)
 }
 
+func TestDedupeHashTable_ConcurrentInsertAndLookup(t *testing.T) {
+	a := assert.New(t)
+	tbl := NewDedupeHashTable()
+
+	const entries = 100
+	var wg sync.WaitGroup
+	for i := 0; i < entries; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			entry := newTestEntry(uint64(i%10), fmt.Sprintf("block-%d", i))
+			tbl.Insert(entry)
+			got, ok := tbl.Lookup(entry.CRC64, entry.SHA256)
+			a.True(ok)
+			a.Equal(entry.TargetURI, got.TargetURI)
+		}()
+	}
+	wg.Wait()
+
+	a.Equal(entries, tbl.Len())
+}
+
+func TestDedupeHashTable_StatsForCRC64(t *testing.T) {
+	a := assert.New(t)
+	tbl := NewDedupeHashTable()
+
+	tbl.Insert(newTestEntry(100, "alpha"))
+	tbl.Insert(newTestEntry(100, "beta"))
+	tbl.Insert(newTestEntry(200, "gamma"))
+
+	stats := tbl.StatsForCRC64(100)
+	a.Equal(3, stats.Entries)
+	a.Equal(2, stats.Buckets)
+	a.Equal(2, stats.BucketEntries)
+
+	stats = tbl.StatsForCRC64(999)
+	a.Equal(3, stats.Entries)
+	a.Equal(2, stats.Buckets)
+	a.Equal(0, stats.BucketEntries)
+}
+
 func TestDedupeHashTable_RefCounting(t *testing.T) {
 	a := assert.New(t)
 	tbl := NewDedupeHashTable()
@@ -176,6 +220,28 @@ func TestDedupeHashTable_Expiry(t *testing.T) {
 	removed := tbl.EvictExpired()
 	a.Equal(1, removed)
 	a.Equal(1, tbl.Len())
+}
+
+func TestDedupeHashTable_InsertReplacesExpiredEntry(t *testing.T) {
+	a := assert.New(t)
+	tbl := NewDedupeHashTable()
+
+	expired := newTestEntry(100, "alpha")
+	expired.TargetURI = "expired"
+	expired.TTL = time.Millisecond
+	expired.CreatedAt = time.Now().Add(-time.Hour)
+	tbl.Insert(expired)
+
+	replacement := newTestEntry(100, "alpha")
+	replacement.TargetURI = "replacement"
+	stored, inserted := tbl.Insert(replacement)
+
+	a.True(inserted)
+	a.Equal("replacement", stored.TargetURI)
+	a.Equal(1, tbl.Len())
+	got, ok := tbl.Lookup(replacement.CRC64, replacement.SHA256)
+	a.True(ok)
+	a.Equal("replacement", got.TargetURI)
 }
 
 func TestDedupeHashTable_Clear(t *testing.T) {

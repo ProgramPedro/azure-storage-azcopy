@@ -58,12 +58,17 @@ func TestBuildSourceGridPlan_Empty(t *testing.T) {
 	a.Empty(plan.Blocks)
 }
 
-func TestBuildSourceGridPlan_NegativeSizeIsError(t *testing.T) {
+func TestBuildSourceGridPlan_NonPositiveSizeIsError(t *testing.T) {
 	a := assert.New(t)
 
 	_, err := buildSourceGridPlan([]rawCommittedBlock{
 		{Name: "ok", Size: 10},
 		{Name: "bad", Size: -1},
+	})
+	a.Error(err)
+
+	_, err = buildSourceGridPlan([]rawCommittedBlock{
+		{Name: "empty", Size: 0},
 	})
 	a.Error(err)
 }

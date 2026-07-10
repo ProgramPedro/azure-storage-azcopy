@@ -21,7 +21,6 @@
 package ste
 
 import (
-	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 
@@ -35,8 +34,8 @@ import (
 // transfers, builds a "source-grid" chunk plan from the source's committed block list and
 // logs how those content-defined boundaries compare to AzCopy's uniform chunk grid.
 //
-// It never changes transfer behavior. Its purpose is to gather real alignment / would-be
-// dedupe-hit numbers before any scheduling change is attempted (Phase 1+).
+// It never changes transfer behavior. Its purpose is to gather real alignment and would-be
+// dedupe-hit measurements independently of act mode.
 
 // PlannedBlock describes one block of a source-grid chunk plan: a contiguous range of the
 // source blob whose boundaries match the source's committed block list rather than AzCopy's
@@ -47,10 +46,10 @@ type PlannedBlock struct {
 	SrcBlockName string
 
 	// CRC64 and SHA256 are intended to be populated from the extended GetBlockList response
-	// (include=crc64,sha256). They are left zero until that service extension is available;
-	// Phase 0 only needs the boundaries (offset/size), not the hashes.
-	CRC64  uint64
-	SHA256 [32]byte
+	// (include=crc64,sha256). HasHashes is true only when both hashes were present and valid.
+	CRC64     uint64
+	SHA256    [32]byte
+	HasHashes bool
 }
 
 // SourceGridPlan is an ordered, contiguous set of blocks covering [0, TotalSize) of a source
@@ -64,20 +63,22 @@ type SourceGridPlan struct {
 // and its size, plus the optional per-block content hashes returned when the service supports the
 // include=crc64,sha256 extension. Offsets are derived (committed block lists are returned in order).
 type rawCommittedBlock struct {
-	Name   string
-	Size   int64
-	CRC64  uint64
-	SHA256 [32]byte
+	Name      string
+	Size      int64
+	CRC64     uint64
+	SHA256    [32]byte
+	HasHashes bool
 }
 
 // buildSourceGridPlan converts an ordered committed block list into a SourceGridPlan, assigning
-// each block a contiguous offset equal to the prefix sum of the preceding block sizes.
+// each block a contiguous offset equal to the prefix sum of the preceding block sizes. Non-positive
+// block sizes are rejected because they cannot be scheduled as HTTP ranges.
 func buildSourceGridPlan(blocks []rawCommittedBlock) (*SourceGridPlan, error) {
 	plan := &SourceGridPlan{Blocks: make([]PlannedBlock, 0, len(blocks))}
 	var offset int64
 	for i, b := range blocks {
-		if b.Size < 0 {
-			return nil, fmt.Errorf("committed block %d (%q) has negative size %d", i, b.Name, b.Size)
+		if b.Size <= 0 {
+			return nil, fmt.Errorf("committed block %d (%q) has non-positive size %d", i, b.Name, b.Size)
 		}
 		plan.Blocks = append(plan.Blocks, PlannedBlock{
 			Offset:       offset,
@@ -85,6 +86,7 @@ func buildSourceGridPlan(blocks []rawCommittedBlock) (*SourceGridPlan, error) {
 			SrcBlockName: b.Name,
 			CRC64:        b.CRC64,
 			SHA256:       b.SHA256,
+			HasHashes:    b.HasHashes,
 		})
 		offset += b.Size
 	}
@@ -196,28 +198,19 @@ func observeSourceGrid(jptm IJobPartTransferMgr) {
 		return
 	}
 
-	raw := make([]rawCommittedBlock, 0, len(resp.CommittedBlocks))
+	raw := rawCommittedBlocksFromResponse(resp)
 	hashedBlocks := 0
 	for i, b := range resp.CommittedBlocks {
-		rb := rawCommittedBlock{
-			Name: common.IffNotNil(b.Name, ""),
-			Size: common.IffNotNil(b.Size, 0),
-		}
-		// Azure Storage encodes CRC64 little-endian (matches crc64.Checksum(content, azure table)).
-		if len(b.Crc64) == 8 {
-			rb.CRC64 = binary.LittleEndian.Uint64(b.Crc64)
-		}
-		copy(rb.SHA256[:], b.Sha256)
-		if len(b.Crc64) > 0 || len(b.Sha256) > 0 {
+		rb := raw[i]
+		if rb.HasHashes {
 			hashedBlocks++
 		}
-		raw = append(raw, rb)
 
 		// Phase 0 read-only log of the extended per-block fields exactly as returned by the service.
 		jptm.LogAtLevelForCurrentTransfer(common.LogInfo, fmt.Sprintf(
-			"dedupe-observe: block[%d] name=%s offset=%d size=%d crc64=%s sha256=%s",
+			"dedupe-observe: block[%d] name=%s offset=%d size=%d hasCompleteHashes=%t crc64=%016x sha256=%x crc64LE=%s",
 			i, rb.Name, common.IffNotNil(b.Offset, -1), rb.Size,
-			hex.EncodeToString(b.Crc64), hex.EncodeToString(b.Sha256)))
+			rb.HasHashes, rb.CRC64, rb.SHA256, hex.EncodeToString(b.Crc64)))
 	}
 
 	jptm.LogAtLevelForCurrentTransfer(common.LogInfo, fmt.Sprintf(

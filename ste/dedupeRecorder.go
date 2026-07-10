@@ -31,16 +31,9 @@ import (
 	"github.com/Azure/azure-storage-azcopy/v10/common"
 )
 
-// This file implements "Phase 1" of the block-level dedupe prototype: "record + measure".
-//
-// Building on the read-only Phase 0 observer (sourceGridObserver.go), it records each
-// source committed block that carries content hashes into a per-job DedupeHashTable, and
-// measures the "would-be" dedupe hit rate: how many migrated blocks have content identical
-// to a block already recorded earlier in the same job (within a blob or across blobs).
-//
-// Like Phase 0, it is gated on AZCOPY_DEDUPE_OBSERVE=true and NEVER changes transfer
-// behavior. Its only job is to prove the real, end-to-end dedupe potential with hard numbers
-// before any bytes are actually skipped (Phase 2) or the chunk grid is changed (Phase 3).
+// This file owns the per-job state shared by the block-level dedupe prototype. Observe mode
+// records and measures potential hits without changing transfers; act mode records only committed
+// destination blocks and uses them to make safe staging decisions.
 
 // dedupeJobState holds a single job's dedupe tables plus cumulative would-be-hit counters.
 type dedupeJobState struct {
@@ -69,6 +62,8 @@ type dedupeJobState struct {
 	sourceStagedBlocks   int64 // blocks staged from the source (real source reads)
 	sourceStagedBytes    int64 // bytes staged from the source
 	fallbackBlocks       int64 // enforce: hits whose target reference failed and fell back to source
+
+	actMode int32 // active dedupeActMode for this job
 }
 
 // addReferenced records a block that enforce mode staged from the destination (a source read avoided).
@@ -99,9 +94,8 @@ var (
 	dedupeJobs   = make(map[common.JobID]*dedupeJobState)
 )
 
-// dedupeStateForJob returns the dedupe state for a job, creating it on first use. The map is
-// only ever populated when the prototype flag is on (observeSourceGrid is the sole caller), so
-// no per-job memory is allocated in the default code path.
+// dedupeStateForJob returns the dedupe state for a job, creating it on first use. Callers are
+// limited to the observe and act paths, so the default transfer path allocates no dedupe state.
 func dedupeStateForJob(jobID common.JobID) *dedupeJobState {
 	dedupeJobsMu.Lock()
 	defer dedupeJobsMu.Unlock()
@@ -117,9 +111,23 @@ func dedupeStateForJob(jobID common.JobID) *dedupeJobState {
 	return st
 }
 
-// clearDedupeStateForJob drops a job's dedupe table to release its memory. It is safe to call
-// when no state exists. Wiring this to a job-teardown hook is a follow-up; for the opt-in
-// prototype (one job per process invocation) the table is released at process exit.
+func dedupeStateForJobIfExists(jobID common.JobID) (*dedupeJobState, bool) {
+	dedupeJobsMu.Lock()
+	defer dedupeJobsMu.Unlock()
+
+	st, ok := dedupeJobs[jobID]
+	return st, ok
+}
+
+func setDedupeActModeForJob(jobID common.JobID, mode dedupeActMode) {
+	if mode == dedupeActOff {
+		return
+	}
+	atomic.StoreInt32(&dedupeStateForJob(jobID).actMode, int32(mode))
+}
+
+// clearDedupeStateForJob drops a job's dedupe state to release its memory. It is safe to call
+// when no state exists and is invoked after a job reaches a terminal status.
 func clearDedupeStateForJob(jobID common.JobID) {
 	dedupeJobsMu.Lock()
 	defer dedupeJobsMu.Unlock()
@@ -137,7 +145,20 @@ func clearDedupeStateForJob(jobID common.JobID) {
 // Because the destination is a byte-identical copy of the source, each block lives at the same
 // offset/length in the target blob as in the source.
 func recordCommittedBlocks(jobID common.JobID, destURI, destinationSAS string, etag azcore.ETag, plan *SourceGridPlan) (recorded int) {
-	if plan == nil {
+	return recordCommittedBlocksWithObserver(jobID, destURI, destinationSAS, etag, plan, nil)
+}
+
+type dedupeTableRecordEvent struct {
+	Block       PlannedBlock
+	Stored      common.BlockEntry
+	Inserted    bool
+	PreHit      bool
+	TableStats  common.DedupeHashTableStats
+	RecordIndex int
+}
+
+func recordCommittedBlocksWithObserver(jobID common.JobID, destURI, destinationSAS string, etag azcore.ETag, plan *SourceGridPlan, observer func(dedupeTableRecordEvent)) (recorded int) {
+	if plan == nil || etag == "" {
 		return 0
 	}
 	st := dedupeStateForJob(jobID)
@@ -146,7 +167,7 @@ func recordCommittedBlocks(jobID common.JobID, destURI, destinationSAS string, e
 		if !blockHasHashes(b) {
 			continue
 		}
-		st.committed.Insert(common.BlockEntry{
+		stored, inserted := st.committed.Insert(common.BlockEntry{
 			JobID:        jobID,
 			CRC64:        b.CRC64,
 			SHA256:       b.SHA256,
@@ -156,14 +177,22 @@ func recordCommittedBlocks(jobID common.JobID, destURI, destinationSAS string, e
 			ETag:         etag,
 		})
 		recorded++
+		if observer != nil {
+			observer(dedupeTableRecordEvent{
+				Block:       b,
+				Stored:      stored,
+				Inserted:    inserted,
+				TableStats:  st.committed.StatsForCRC64(b.CRC64),
+				RecordIndex: recorded,
+			})
+		}
 	}
 	return recorded
 }
 
 // destinationWithSASForDedupe returns an executable destination URL for later use as
-// x-ms-copy-source. The destination URL in TransferInfo can be stored without SAS, so append the
-// job's destination SAS when available. The table is in-memory and logs go through AzCopy's
-// sanitizer; stripping auth here causes private DevFabric/Azure targetURI reuse to fail with 401.
+// x-ms-copy-source. The destination client URL commonly already contains the SAS; merge any
+// missing SAS fields without duplicating query parameters.
 func destinationWithSASForDedupe(destURI, destinationSAS string) string {
 	if destinationSAS == "" {
 		return destURI
@@ -179,18 +208,25 @@ func destinationWithSASForDedupe(destURI, destinationSAS string) string {
 	if sas == "" {
 		return destURI
 	}
-	if u.RawQuery == "" {
-		u.RawQuery = sas
-	} else {
-		u.RawQuery += "&" + sas
+
+	query, err := url.ParseQuery(u.RawQuery)
+	if err != nil {
+		return destURI
 	}
+	sasQuery, err := url.ParseQuery(sas)
+	if err != nil {
+		return destURI
+	}
+
+	for key, values := range sasQuery {
+		query[key] = append([]string(nil), values...)
+	}
+	u.RawQuery = query.Encode()
 	return u.String()
 }
 
-// logDedupeActSummary logs the job's cumulative Phase 2 savings. It is emitted once per committed
-// blob (from the sender Epilogue), so the final line for a job is the job total — mirroring the
-// Phase 1 running-total pattern and avoiding the need for a job-teardown hook. It reports how many
-// source reads dedupe avoided (enforce) or would avoid (shadow).
+// logDedupeActSummary logs a running view of the job's cumulative Phase 2 savings. The terminal
+// job summary is emitted separately when the job completes.
 func logDedupeActSummary(jptm IJobPartTransferMgr, mode dedupeActMode) {
 	st := dedupeStateForJob(jptm.Info().JobID)
 
@@ -208,25 +244,70 @@ func logDedupeActSummary(jptm IJobPartTransferMgr, mode dedupeActMode) {
 		// source. Total = referenced + source; avoided source-read bytes = referencedBytes.
 		totalStagedBytes := referencedBytes + sourceBytes
 		jptm.LogAtLevelForCurrentTransfer(common.LogInfo, fmt.Sprintf(
-			"dedupe-summary(enforce): avoided %d source-read bytes across %d block(s) = %.1f%% of %d staged bytes; "+
-				"staged %d block(s)/%d bytes from source; %d fallback(s)",
-			referencedBytes, referencedBlocks, dedupePercent(referencedBytes, totalStagedBytes), totalStagedBytes,
-			sourceBlocks, sourceBytes, fallbacks))
+			"dedupe-summary(enforce): dedupe-target blocks=%d bytes=%d; sourceURI blocks=%d bytes=%d; "+
+				"WAN savings=%d bytes (%.1f%% of %d staged bytes); fallback blocks=%d",
+			referencedBlocks, referencedBytes, sourceBlocks, sourceBytes,
+			referencedBytes, dedupePercent(referencedBytes, totalStagedBytes), totalStagedBytes,
+			fallbacks))
 	case dedupeActShadow:
 		// Every block is staged from the source in shadow mode, so sourceBytes is the total; the
 		// would-reference blocks are the subset that enforce would have avoided.
 		jptm.LogAtLevelForCurrentTransfer(common.LogInfo, fmt.Sprintf(
-			"dedupe-summary(shadow): %d block(s)/%d bytes WOULD be avoided under enforce = %.1f%% of %d staged bytes "+
-				"(all currently staged from source)",
-			wouldRefBlocks, wouldRefBytes, dedupePercent(wouldRefBytes, sourceBytes), sourceBytes))
+			"dedupe-summary(shadow): would-dedupe-target blocks=%d bytes=%d; sourceURI blocks=%d bytes=%d; "+
+				"potential WAN savings=%d bytes (%.1f%% of %d staged bytes); all bytes currently staged from source",
+			wouldRefBlocks, wouldRefBytes, sourceBlocks, sourceBytes,
+			wouldRefBytes, dedupePercent(wouldRefBytes, sourceBytes), sourceBytes))
 	}
 }
 
-// blockHasHashes reports whether a planned block carries content hashes from the extended
-// GetBlockList response. When the service GetHash feature is off (or include was not honored),
-// both hashes are left zero and the block is not eligible for dedupe measurement.
+func logDedupeJobSummary(jobID common.JobID, log func(common.LogLevel, string)) {
+	st, ok := dedupeStateForJobIfExists(jobID)
+	if !ok {
+		return
+	}
+	mode := dedupeActMode(atomic.LoadInt32(&st.actMode))
+	if mode == dedupeActOff {
+		return
+	}
+	log(common.LogInfo, dedupeJobSummaryMessage(mode, st))
+}
+
+func finalizeDedupeJob(jobID common.JobID, log func(common.LogLevel, string)) {
+	logDedupeJobSummary(jobID, log)
+	clearDedupeStateForJob(jobID)
+}
+
+func dedupeJobSummaryMessage(mode dedupeActMode, st *dedupeJobState) string {
+	referencedBlocks := atomic.LoadInt64(&st.referencedBlocks)
+	referencedBytes := atomic.LoadInt64(&st.referencedBytes)
+	wouldRefBlocks := atomic.LoadInt64(&st.wouldReferenceBlocks)
+	wouldRefBytes := atomic.LoadInt64(&st.wouldReferenceBytes)
+	sourceBlocks := atomic.LoadInt64(&st.sourceStagedBlocks)
+	sourceBytes := atomic.LoadInt64(&st.sourceStagedBytes)
+	fallbacks := atomic.LoadInt64(&st.fallbackBlocks)
+
+	switch mode {
+	case dedupeActShadow:
+		totalStagedBytes := sourceBytes
+		return fmt.Sprintf(
+			"dedupe-job-summary(shadow): totalBlocks=%d wouldTargetURIBlocks=%d sourceURIBlocks=%d fallbackBlocks=%d potentialAvoidedSourceReadBytes=%d totalStagedBytes=%d potentialWanSavingsPercent=%.1f",
+			sourceBlocks, wouldRefBlocks, sourceBlocks, fallbacks, wouldRefBytes, totalStagedBytes,
+			dedupePercent(wouldRefBytes, totalStagedBytes))
+	case dedupeActEnforce:
+		totalStagedBytes := referencedBytes + sourceBytes
+		return fmt.Sprintf(
+			"dedupe-job-summary(enforce): totalBlocks=%d targetURIBlocks=%d sourceURIBlocks=%d fallbackBlocks=%d avoidedSourceReadBytes=%d totalStagedBytes=%d wanSavingsPercent=%.1f",
+			referencedBlocks+sourceBlocks, referencedBlocks, sourceBlocks, fallbacks, referencedBytes, totalStagedBytes,
+			dedupePercent(referencedBytes, totalStagedBytes))
+	default:
+		return "dedupe-job-summary(off): disabled"
+	}
+}
+
+// blockHasHashes reports whether a planned block carried both content hashes in the extended
+// GetBlockList response. Presence is tracked separately because an all-zero hash is valid.
 func blockHasHashes(b PlannedBlock) bool {
-	return b.CRC64 != 0 || b.SHA256 != ([32]byte{})
+	return b.HasHashes
 }
 
 // measureAndRecord performs the Phase 1 lookup-then-record over a set of planned blocks against
@@ -241,18 +322,23 @@ func blockHasHashes(b PlannedBlock) bool {
 // content, so concurrent identical blocks can be under-counted as misses. That is acceptable for a
 // measurement phase — the reported hit rate is conservative (never over-counted).
 func measureAndRecord(table *common.DedupeHashTable, jobID common.JobID, targetURI string, blocks []PlannedBlock) (hashed, hits, dedupableBytes int64) {
+	return measureAndRecordWithObserver(table, jobID, targetURI, blocks, nil)
+}
+
+func measureAndRecordWithObserver(table *common.DedupeHashTable, jobID common.JobID, targetURI string, blocks []PlannedBlock, observer func(dedupeTableRecordEvent)) (hashed, hits, dedupableBytes int64) {
 	for _, b := range blocks {
 		if !blockHasHashes(b) {
 			continue
 		}
 		hashed++
 
-		if _, hit := table.Lookup(b.CRC64, b.SHA256); hit {
+		_, hit := table.Lookup(b.CRC64, b.SHA256)
+		if hit {
 			hits++
 			dedupableBytes += b.Size
 		}
 
-		table.Insert(common.BlockEntry{
+		stored, inserted := table.Insert(common.BlockEntry{
 			JobID:     jobID,
 			CRC64:     b.CRC64,
 			SHA256:    b.SHA256,
@@ -264,13 +350,22 @@ func measureAndRecord(table *common.DedupeHashTable, jobID common.JobID, targetU
 			// ETag is populated in Phase 2, where recording happens after a successful
 			// destination write; Phase 1 records pre-write, for measurement only.
 		})
+		if observer != nil {
+			observer(dedupeTableRecordEvent{
+				Block:       b,
+				Stored:      stored,
+				Inserted:    inserted,
+				PreHit:      hit,
+				TableStats:  table.StatsForCRC64(b.CRC64),
+				RecordIndex: int(hashed),
+			})
+		}
 	}
 	return hashed, hits, dedupableBytes
 }
 
-// sanitizedDestForDedupe returns the destination blob URL with any query string (e.g. a SAS
-// token) stripped, so credentials are never stored in the table. If the URL cannot be parsed it
-// is returned unchanged (the table is in-memory and prototype-only).
+// sanitizedDestForDedupe strips the query string from a destination URL before logging or
+// comparing it. The committed table intentionally retains an authenticated URL for reuse.
 func sanitizedDestForDedupe(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -297,7 +392,14 @@ func recordSourceGridForDedupe(jptm IJobPartTransferMgr, plan *SourceGridPlan) {
 	st := dedupeStateForJob(info.JobID)
 	targetURI := sanitizedDestForDedupe(info.Destination)
 
-	hashed, hits, dedupableBytes := measureAndRecord(st.table, info.JobID, targetURI, plan.Blocks)
+	hashed, hits, dedupableBytes := measureAndRecordWithObserver(st.table, info.JobID, targetURI, plan.Blocks, func(event dedupeTableRecordEvent) {
+		jptm.LogAtLevelForCurrentTransfer(common.LogDebug, fmt.Sprintf(
+			"dedupe-table(observe): record=%d inserted=%t wouldBeHit=%t entries=%d buckets=%d bucketEntries=%d refCount=%d "+
+				"crc64=%016x sha256=%x offset=%d size=%d target=%s",
+			event.RecordIndex, event.Inserted, event.PreHit, event.TableStats.Entries, event.TableStats.Buckets,
+			event.TableStats.BucketEntries, event.Stored.RefCount, event.Block.CRC64, event.Block.SHA256,
+			event.Block.Offset, event.Block.Size, sanitizedDestForDedupe(event.Stored.TargetURI)))
+	})
 	if hashed == 0 {
 		return // nothing eligible (service GetHash feature off, or include not honored)
 	}
@@ -362,6 +464,9 @@ func decideStaging(index map[srcBlockKey]srcBlockHashes, committed *common.Dedup
 	entry, hit := committed.Lookup(h.crc64, h.sha256)
 	if !hit {
 		return common.BlockEntry{}, false // identical content not yet migrated to the destination
+	}
+	if entry.TargetURI == "" || entry.TargetOffset < 0 || entry.ETag == "" || entry.TargetLength != size {
+		return common.BlockEntry{}, false // never reuse an unversioned or differently-sized target range
 	}
 	if sameDedupeTarget(entry.TargetURI, currentTargetURI) {
 		return common.BlockEntry{}, false // avoid unsafe same-blob/self reuse; wait for a committed target blob

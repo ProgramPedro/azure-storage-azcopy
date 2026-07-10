@@ -22,6 +22,7 @@ package ste
 
 import (
 	"crypto/sha256"
+	"net/url"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -44,6 +45,7 @@ func hashedBlock(content string, offset, size int64) PlannedBlock {
 		SrcBlockName: content,
 		CRC64:        crc,
 		SHA256:       sum,
+		HasHashes:    true,
 	}
 }
 
@@ -51,8 +53,9 @@ func TestBlockHasHashes(t *testing.T) {
 	a := assert.New(t)
 
 	a.True(blockHasHashes(hashedBlock("alpha", 0, 10)))
-	a.True(blockHasHashes(PlannedBlock{CRC64: 1}))
-	a.True(blockHasHashes(PlannedBlock{SHA256: [32]byte{0: 1}}))
+	a.True(blockHasHashes(PlannedBlock{HasHashes: true})) // valid hashes may contain all zero bytes
+	a.False(blockHasHashes(PlannedBlock{CRC64: 1}))
+	a.False(blockHasHashes(PlannedBlock{SHA256: [32]byte{0: 1}}))
 	a.False(blockHasHashes(PlannedBlock{Offset: 0, Size: 100})) // no hashes -> not eligible
 }
 
@@ -149,14 +152,34 @@ func TestMeasureAndRecord_PopulatesTargetRange(t *testing.T) {
 	a.EqualValues(1000, got.TargetLength)
 }
 
-func TestDestinationWithSASForDedupe_AppendsDestinationSAS(t *testing.T) {
+func TestDestinationWithSASForDedupe_MergesDestinationSAS(t *testing.T) {
 	a := assert.New(t)
 
 	got := destinationWithSASForDedupe("https://acct.blob.core.windows.net/c/b.bin", "?sv=2021&sig=SECRET")
-	a.Equal("https://acct.blob.core.windows.net/c/b.bin?sv=2021&sig=SECRET", got)
+	u, err := url.Parse(got)
+	a.NoError(err)
+	a.Equal("2021", u.Query().Get("sv"))
+	a.Equal("SECRET", u.Query().Get("sig"))
 
 	got = destinationWithSASForDedupe("https://acct.blob.core.windows.net/c/b.bin?existing=true", "sv=2021&sig=SECRET")
-	a.Equal("https://acct.blob.core.windows.net/c/b.bin?existing=true&sv=2021&sig=SECRET", got)
+	u, err = url.Parse(got)
+	a.NoError(err)
+	a.Equal("true", u.Query().Get("existing"))
+	a.Equal("2021", u.Query().Get("sv"))
+	a.Equal("SECRET", u.Query().Get("sig"))
+
+	alreadyAuthenticated := "https://acct.blob.core.windows.net/c/b.bin?sv=2021&sig=SECRET"
+	u, err = url.Parse(destinationWithSASForDedupe(alreadyAuthenticated, "sv=2021&sig=SECRET"))
+	a.NoError(err)
+	a.Len(u.Query()["sig"], 1)
+
+	u, err = url.Parse(destinationWithSASForDedupe(
+		"https://acct.blob.core.windows.net/c/b.bin?sv=old&sig=OLD",
+		"sv=2021&sig=NEW"))
+	a.NoError(err)
+	a.Equal("2021", u.Query().Get("sv"))
+	a.Equal("NEW", u.Query().Get("sig"))
+	a.Len(u.Query()["sig"], 1)
 
 	plain := "https://acct.blob.core.windows.net/c/b.bin"
 	a.Equal(plain, destinationWithSASForDedupe(plain, ""))
@@ -267,6 +290,31 @@ func TestDecideStaging_Hit(t *testing.T) {
 	a.EqualValues(0, target.TargetOffset)
 	a.EqualValues(100, target.TargetLength)
 	a.Equal(azcore.ETag("etag-1"), target.ETag)
+}
+
+func TestDecideStaging_RejectsUnsafeTarget(t *testing.T) {
+	a := assert.New(t)
+
+	b := hashedBlock("a", 0, 100)
+	idx := buildSourceBlockHashIndex(&SourceGridPlan{Blocks: []PlannedBlock{b}})
+
+	for _, entry := range []common.BlockEntry{
+		{
+			CRC64: b.CRC64, SHA256: b.SHA256,
+			TargetURI:    "https://acct.blob.core.windows.net/c/missing-etag",
+			TargetLength: 100,
+		},
+		{
+			CRC64: b.CRC64, SHA256: b.SHA256,
+			TargetURI:    "https://acct.blob.core.windows.net/c/wrong-size",
+			TargetLength: 50, ETag: azcore.ETag("etag-1"),
+		},
+	} {
+		committed := common.NewDedupeHashTable()
+		committed.Insert(entry)
+		_, reference := decideStaging(idx, committed, 0, 100, "https://acct.blob.core.windows.net/c/current")
+		a.False(reference)
+	}
 }
 
 func TestDecideStaging_SameTargetIsNotReusable(t *testing.T) {

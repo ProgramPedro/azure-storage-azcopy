@@ -61,7 +61,8 @@ type BlockEntry struct {
 	// CreatedAt is the time the entry was recorded. It is set automatically on
 	// insert when left as the zero value.
 	CreatedAt time.Time
-	// RefCount is the number of candidate blocks currently referencing this entry.
+	// RefCount counts insertions/references to this fingerprint. Insert initializes it
+	// to one and increments it when the same fingerprint is inserted again.
 	RefCount int64
 }
 
@@ -91,6 +92,15 @@ type DedupeHashTable struct {
 	// almost always of length one; it only grows when distinct blocks happen to
 	// share a CRC64 value.
 	buckets map[uint64][]*BlockEntry
+	entries int
+}
+
+// DedupeHashTableStats is a point-in-time view of table growth. BucketEntries
+// reports how many entries share the requested CRC64 bucket.
+type DedupeHashTableStats struct {
+	Entries       int
+	Buckets       int
+	BucketEntries int
 }
 
 // NewDedupeHashTable returns an empty hash table ready for a single migration.
@@ -118,6 +128,7 @@ func (t *DedupeHashTable) findLocked(crc64 uint64, sha256 [32]byte) (*BlockEntry
 func (t *DedupeHashTable) removeAtLocked(crc64 uint64, idx int) {
 	bucket := t.buckets[crc64]
 	bucket = append(bucket[:idx], bucket[idx+1:]...)
+	t.entries--
 	if len(bucket) == 0 {
 		delete(t.buckets, crc64)
 	} else {
@@ -136,9 +147,12 @@ func (t *DedupeHashTable) Insert(entry BlockEntry) (stored BlockEntry, inserted 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if existing, _ := t.findLocked(entry.CRC64, entry.SHA256); existing != nil {
-		existing.RefCount++
-		return *existing, false
+	if existing, idx := t.findLocked(entry.CRC64, entry.SHA256); existing != nil {
+		if !existing.IsExpired() {
+			existing.RefCount++
+			return *existing, false
+		}
+		t.removeAtLocked(entry.CRC64, idx)
 	}
 
 	if entry.CreatedAt.IsZero() {
@@ -150,6 +164,7 @@ func (t *DedupeHashTable) Insert(entry BlockEntry) (stored BlockEntry, inserted 
 
 	e := entry // store a copy so the caller cannot mutate table state by reference
 	t.buckets[entry.CRC64] = append(t.buckets[entry.CRC64], &e)
+	t.entries++
 	return e, true
 }
 
@@ -182,6 +197,19 @@ func (t *DedupeHashTable) LookupByCRC64(crc64 uint64) []BlockEntry {
 		}
 	}
 	return out
+}
+
+// StatsForCRC64 returns table growth details for logging/diagnostics.
+func (t *DedupeHashTable) StatsForCRC64(crc64 uint64) DedupeHashTableStats {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	stats := DedupeHashTableStats{
+		Entries:       t.entries,
+		Buckets:       len(t.buckets),
+		BucketEntries: len(t.buckets[crc64]),
+	}
+	return stats
 }
 
 // IncrementRefCount increases the reference count of the matching entry and
@@ -252,6 +280,7 @@ func (t *DedupeHashTable) EvictExpired() int {
 			t.buckets[crc64] = kept
 		}
 	}
+	t.entries -= removed
 	return removed
 }
 
@@ -260,11 +289,7 @@ func (t *DedupeHashTable) Len() int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	n := 0
-	for _, bucket := range t.buckets {
-		n += len(bucket)
-	}
-	return n
+	return t.entries
 }
 
 // Clear removes all entries from the table. Call this when a migration finishes
@@ -274,4 +299,5 @@ func (t *DedupeHashTable) Clear() {
 	defer t.mu.Unlock()
 
 	t.buckets = make(map[uint64][]*BlockEntry)
+	t.entries = 0
 }

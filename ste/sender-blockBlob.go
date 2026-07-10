@@ -358,11 +358,23 @@ func (s *blockBlobSenderBase) Epilogue() {
 			if resp.ETag != nil {
 				etag = *resp.ETag
 			}
-			_, destinationSAS := jptm.SAS()
-			recorded := recordCommittedBlocks(jptm.Info().JobID, s.destBlockBlobClient.URL(), destinationSAS, etag, s.dedupePlan)
-			jptm.LogAtLevelForCurrentTransfer(common.LogInfo, fmt.Sprintf(
-				"dedupe-act(%s): recorded %d committed block(s) for %q into the job dedupe table",
-				s.dedupeMode, recorded, jptm.Info().DstFilePath))
+			if etag == "" {
+				jptm.LogAtLevelForCurrentTransfer(common.LogWarning,
+					"dedupe-act: committed destination response had no ETag; this blob will not be used as a dedupe target")
+			} else {
+				_, destinationSAS := jptm.SAS()
+				recorded := recordCommittedBlocksWithObserver(jptm.Info().JobID, s.destBlockBlobClient.URL(), destinationSAS, etag, s.dedupePlan, func(event dedupeTableRecordEvent) {
+					jptm.LogAtLevelForCurrentTransfer(common.LogDebug, fmt.Sprintf(
+						"dedupe-table(committed): record=%d inserted=%t entries=%d buckets=%d bucketEntries=%d refCount=%d "+
+							"crc64=%016x sha256=%x target=%s offset=%d size=%d etag=%q",
+						event.RecordIndex, event.Inserted, event.TableStats.Entries, event.TableStats.Buckets,
+						event.TableStats.BucketEntries, event.Stored.RefCount, event.Block.CRC64, event.Block.SHA256,
+						sanitizedDestForDedupe(event.Stored.TargetURI), event.Stored.TargetOffset, event.Stored.TargetLength, event.Stored.ETag))
+				})
+				jptm.LogAtLevelForCurrentTransfer(common.LogInfo, fmt.Sprintf(
+					"dedupe-act(%s): recorded %d committed block(s) for %q into the job dedupe table",
+					s.dedupeMode, recorded, jptm.Info().DstFilePath))
+			}
 			logDedupeActSummary(jptm, s.dedupeMode)
 		}
 

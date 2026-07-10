@@ -104,10 +104,12 @@ func TestRawCommittedBlocksFromResponse(t *testing.T) {
 	a.Equal(uint64(0x0102030405060708), raw[0].CRC64) // decoded little-endian
 	a.Equal(byte(0xAA), raw[0].SHA256[0])
 	a.Equal(byte(0xBB), raw[0].SHA256[31])
+	a.True(raw[0].HasHashes)
 
 	a.Equal("blk-1", raw[1].Name)
 	a.EqualValues(200, raw[1].Size)
 	a.EqualValues(0, raw[1].CRC64)
+	a.False(raw[1].HasHashes)
 	a.Equal([32]byte{}, raw[1].SHA256)
 }
 
@@ -150,6 +152,19 @@ func TestRecordCommittedBlocks_NilPlanIsNoOp(t *testing.T) {
 	a.Equal(0, recordCommittedBlocks(jobID, "uri", "", "etag", nil))
 }
 
+func TestRecordCommittedBlocks_MissingETagIsNoOp(t *testing.T) {
+	a := assert.New(t)
+
+	jobID := common.NewJobID()
+	defer clearDedupeStateForJob(jobID)
+
+	plan := &SourceGridPlan{Blocks: []PlannedBlock{hashedBlock("alpha", 0, 100)}}
+	a.Equal(0, recordCommittedBlocks(jobID, "https://acct.blob.core.windows.net/c/migrated", "?sig=secret", "", plan))
+
+	_, exists := dedupeStateForJobIfExists(jobID)
+	a.False(exists)
+}
+
 func TestDedupeJobStateCounters(t *testing.T) {
 	a := assert.New(t)
 	st := &dedupeJobState{}
@@ -168,4 +183,48 @@ func TestDedupeJobStateCounters(t *testing.T) {
 	a.EqualValues(2, st.sourceStagedBlocks)
 	a.EqualValues(100, st.sourceStagedBytes)
 	a.EqualValues(1, st.fallbackBlocks)
+}
+
+func TestDedupeJobSummaryMessageEnforce(t *testing.T) {
+	a := assert.New(t)
+	st := &dedupeJobState{}
+	st.addReferenced(100)
+	st.addReferenced(50)
+	st.addSourceStaged(30)
+	st.addSourceStaged(70)
+	st.addFallback()
+
+	a.Equal(
+		"dedupe-job-summary(enforce): totalBlocks=4 targetURIBlocks=2 sourceURIBlocks=2 fallbackBlocks=1 avoidedSourceReadBytes=150 totalStagedBytes=250 wanSavingsPercent=60.0",
+		dedupeJobSummaryMessage(dedupeActEnforce, st))
+}
+
+func TestDedupeJobSummaryMessageShadow(t *testing.T) {
+	a := assert.New(t)
+	st := &dedupeJobState{}
+	st.addWouldReference(150)
+	st.addSourceStaged(100)
+	st.addSourceStaged(200)
+
+	a.Equal(
+		"dedupe-job-summary(shadow): totalBlocks=2 wouldTargetURIBlocks=1 sourceURIBlocks=2 fallbackBlocks=0 potentialAvoidedSourceReadBytes=150 totalStagedBytes=300 potentialWanSavingsPercent=50.0",
+		dedupeJobSummaryMessage(dedupeActShadow, st))
+}
+
+func TestFinalizeDedupeJobLogsAndClearsState(t *testing.T) {
+	a := assert.New(t)
+	jobID := common.NewJobID()
+	st := dedupeStateForJob(jobID)
+	st.addReferenced(100)
+	setDedupeActModeForJob(jobID, dedupeActEnforce)
+
+	var message string
+	finalizeDedupeJob(jobID, func(level common.LogLevel, value string) {
+		a.Equal(common.LogInfo, level)
+		message = value
+	})
+
+	a.Contains(message, "dedupe-job-summary(enforce)")
+	_, exists := dedupeStateForJobIfExists(jobID)
+	a.False(exists)
 }
